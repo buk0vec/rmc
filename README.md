@@ -1,4 +1,4 @@
-# RMC (Rythymic Music Coder)
+# RMC (Rhythmic Music Coder)
 
 ```
 ⠀⠀⠀⠀⠀⢀⣼⣿⣆⠀⠀⠀
