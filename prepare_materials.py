@@ -6,7 +6,9 @@ from pcmfile import *
 from quantize import *
 from window import *
 from mdct import *
+from pacbfile import *
 from pacfile import *
+from rmcfile import RMCFile
 
 def quantize_td_fp(inFilename, outFilename):
     inFile = PCMFile(inFilename)
@@ -196,6 +198,105 @@ def pac(inFilename, outFilename, rate_kb=128):
         # elapsed = time.time()-elapsed
         # print( "\nDone with Encode/Decode test\n")
         # print( elapsed ," seconds elapsed")
+        
+def pacb(inFilename, outFilename, rate_kb=128):
+    codedFilename = f"coded/{Path(outFilename).stem}.pacb"
+    # print ("\nRunning the PAC coder (" + inFilename +
+    #     " -> " + codedFilename + " -> " +
+    #     outFilename+"):")
+    # elapsed = time.time()
+
+    for iDir, Direction in enumerate(("Encode", "Decode")):
+
+        # create the audio file objects
+        if Direction == "Encode":
+            print( "\n\tEncoding input PCM file...", end="")
+            inFile= PCMFile(inFilename)
+            outFile = PACBFile(codedFilename)
+        else: # "Decode"
+            print( "\n\tDecoding coded PACB file...",end="")
+            inFile = PACBFile(codedFilename)
+            outFile= PCMFile(outFilename)
+        # only difference is file names and type of AudioFile object
+
+        # open input file
+        codingParams=inFile.OpenForReading()  # (includes reading header)
+        
+
+        # pass parameters to the output file
+        if Direction == "Encode":
+            # set additional parameters that are needed for PAC file
+            # (beyond those set by the PCM file on open)
+            codingParams.nMDCTLines = 1024
+            codingParams.nScaleBits = 3
+            codingParams.nMantSizeBits = 5
+            codingParams.targetBitsPerSample = rate_kb * 1000 / codingParams.sampleRate
+            print(f"Target bits/sample: {codingParams.targetBitsPerSample:0.1f}")
+            # tell the PCM file how large the block size is
+            codingParams.nSamplesPerBlock = codingParams.nMDCTLines
+        else: # "Decode"
+            # set PCM parameters (the rest is same as set by PAC file on open)
+            codingParams.bitsPerSample = 16
+        # only difference is in setting up the output file parameters
+
+
+        # open the output file
+        outFile.OpenForWriting(codingParams) # (includes writing header)
+
+        # Read the input file and pass its data to the output file to be written
+        while True:
+            data = inFile.ReadDataBlock(codingParams)
+            if not data: break  # we hit the end of the input file
+            outFile.WriteDataBlock(data,codingParams)
+            # Progress update
+            print( ".",end="")  # just to signal how far we've gotten to user
+        # end loop over reading/writing the blocks
+
+        # close the files
+        inFile.Close(codingParams)
+        outFile.Close(codingParams)
+        # end of loop over Encode/Decode
+
+        # elapsed = time.time()-elapsed
+        # print( "\nDone with Encode/Decode test\n")
+        # print( elapsed ," seconds elapsed")
+
+def rmc(inFilename, outFilename, rate_kb=128):
+    codedFilename = f"coded/{Path(inFilename).stem}_rmc_{rate_kb}kbps.rmc"
+
+    for Direction in ("Encode", "Decode"):
+        if Direction == "Encode":
+            print("\n\tEncoding input PCM file...", end="")
+            inFile = PCMFile(inFilename)
+            outFile = RMCFile(codedFilename)
+        else:
+            print("\n\tDecoding coded RMC file...", end="")
+            inFile = RMCFile(codedFilename)
+            outFile = PCMFile(outFilename)
+
+        codingParams = inFile.OpenForReading()
+
+        if Direction == "Encode":
+            codingParams.nMDCTLines = 1024
+            codingParams.nScaleBits = 3
+            codingParams.nMantSizeBits = 5
+            codingParams.targetBitsPerSample = rate_kb * 1000 / codingParams.sampleRate
+            print(f"Target bits/sample: {codingParams.targetBitsPerSample:0.1f}")
+            codingParams.nSamplesPerBlock = codingParams.nMDCTLines
+        else:
+            codingParams.bitsPerSample = 16
+
+        outFile.OpenForWriting(codingParams)
+
+        while True:
+            data = inFile.ReadDataBlock(codingParams)
+            if not data: break
+            outFile.WriteDataBlock(data, codingParams)
+            print(".", end="")
+
+        inFile.Close(codingParams)
+        outFile.Close(codingParams)
+
 
 if __name__ == "__main__":
     reference_files = glob.glob("reference/*.wav")

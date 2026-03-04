@@ -39,6 +39,7 @@ def Decode(scaleFactor,bitAlloc,mantissa,overallScaleFactor,codingParams):
         halfN = halfN_short
         
         
+        pad = N_long//4 - N_short//4
         overlap_and_add = np.zeros(N_long)
         for i in range(N_SHORT_BLOCKS):
             mdctLine = np.zeros(halfN,dtype=np.float64)
@@ -53,7 +54,7 @@ def Decode(scaleFactor,bitAlloc,mantissa,overallScaleFactor,codingParams):
             mdctLine /= rescaleLevel  # put overall gain back to original level
                 # IMDCT and window the data for this channel
             data = WindowForBlockType(codingParams.blockType, N_long, N_short) * IMDCT(mdctLine, halfN, halfN) # takes in halfN MDCT coeffs
-            overlap_and_add[i*halfN_short: i*halfN_short+N_short]+=data 
+            overlap_and_add[pad + i*halfN_short : pad + i*halfN_short + N_short] += data
 
         return overlap_and_add
     
@@ -134,7 +135,8 @@ def EncodeSingleChannel(data,codingParams):
 
 
             # window data for side chain FFT and also window and compute MDCT
-            timeSamples = data[i* N:(i+1)*N]
+            pad = N_long//4 - N_short//4
+            timeSamples = data[pad + i*halfN : pad + i*halfN + N]
             mdctTimeSamples = WindowForBlockType(codingParams.blockType, N_long, N_short) *timeSamples
             mdctLines = MDCT(mdctTimeSamples, halfN, halfN)[:halfN]
 
