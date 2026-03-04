@@ -92,4 +92,7 @@ of bits per sample.
 
 
 if __name__ == "__main__":
-	EncodeDecode(inFilename='harpsichord.wav', targetBitsPerSample=1.5)  # use default parameters
+
+	#EncodeDecode(inFilename='castanets.wav', targetBitsPerSample=2.666)  # use default parameters
+    EncodeDecode(inFilename='castanets.wav', targetBitsPerSample=4)  # use default parameters
+
