@@ -197,7 +197,7 @@ class BlockEntropyCoder:
             if best_pb is None or candidate_pb.nBits < best_pb.nBits:
                 best_idx, best_pb, best_escaped = i, candidate_pb, candidate_escaped
         coded_pb, escaped = best_pb, best_escaped
-        print(f"Used distribution {best_idx}")
+        # print(f"Used distribution {best_idx}")
         escaped_offsets = [v - self.coder.max_value - 1 for v in escaped]
 
         # Compute escaped bits for sizing
