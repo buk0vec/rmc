@@ -7,6 +7,7 @@ from quantize import *
 from window import *
 from mdct import *
 from pacfile import *
+from rmcfile import RMCFile
 
 def quantize_td_fp(inFilename, outFilename):
     inFile = PCMFile(inFilename)
@@ -196,6 +197,43 @@ def pac(inFilename, outFilename, rate_kb=128):
         # elapsed = time.time()-elapsed
         # print( "\nDone with Encode/Decode test\n")
         # print( elapsed ," seconds elapsed")
+
+def rmc(inFilename, outFilename, rate_kb=128):
+    codedFilename = f"coded/{Path(inFilename).stem}_rmc_{rate_kb}kbps.rmc"
+
+    for Direction in ("Encode", "Decode"):
+        if Direction == "Encode":
+            print("\n\tEncoding input PCM file...", end="")
+            inFile = PCMFile(inFilename)
+            outFile = RMCFile(codedFilename)
+        else:
+            print("\n\tDecoding coded RMC file...", end="")
+            inFile = RMCFile(codedFilename)
+            outFile = PCMFile(outFilename)
+
+        codingParams = inFile.OpenForReading()
+
+        if Direction == "Encode":
+            codingParams.nMDCTLines = 1024
+            codingParams.nScaleBits = 3
+            codingParams.nMantSizeBits = 5
+            codingParams.targetBitsPerSample = rate_kb * 1000 / codingParams.sampleRate
+            print(f"Target bits/sample: {codingParams.targetBitsPerSample:0.1f}")
+            codingParams.nSamplesPerBlock = codingParams.nMDCTLines
+        else:
+            codingParams.bitsPerSample = 16
+
+        outFile.OpenForWriting(codingParams)
+
+        while True:
+            data = inFile.ReadDataBlock(codingParams)
+            if not data: break
+            outFile.WriteDataBlock(data, codingParams)
+            print(".", end="")
+
+        inFile.Close(codingParams)
+        outFile.Close(codingParams)
+
 
 if __name__ == "__main__":
     reference_files = glob.glob("reference/*.wav")
