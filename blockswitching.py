@@ -14,6 +14,7 @@ Music 422 -- RMC Project
 
 import numpy as np
 from psychoac import ScaleFactorBands, AssignMDCTLinesFromFreqLimits
+from window import KBDWindow
 
 # ---------------------------------------------------------------------------
 # Block type constants
@@ -52,11 +53,12 @@ def DetectTransient(data, prev_data, threshold=10.0):
                        (e.g. 10.0 means 10x energy increase -> transient)
 
     Returns:
-        True if a transient is detected, False otherwise
+        Index (0..N_SHORT_BLOCKS-1) of the first sub-block where the transient
+        occurs, or -1 if no transient is detected.
     """
     #if all zeros (so first block) don't say it's a transient
     if np.max(np.abs(prev_data)) == 0:
-        return False
+        return -1
 
     N = len(data)
     sub_size = N // N_SHORT_BLOCKS
@@ -66,15 +68,15 @@ def DetectTransient(data, prev_data, threshold=10.0):
         sub = data[i*sub_size:(i+1)*sub_size]
         sub_rms = np.sqrt(np.mean(sub**2))
         if sub_rms > threshold * prev_rms:
-            return True
-    return False
+            return i
+    return -1
 
 
 # ---------------------------------------------------------------------------
 # Block type selection (state machine)
 # ---------------------------------------------------------------------------
 
-def SelectBlockType(transient_detected, prev_block_type):
+def SelectBlockType(k_attack, prev_block_type):
     """
     State machine that decides the block type to use for the *current* block,
     given whether a transient was detected and what the previous block's type was.
@@ -88,13 +90,14 @@ def SelectBlockType(transient_detected, prev_block_type):
         STOP  + (any)         -> LONG    (back to normal)
 
     Arguments:
-        transient_detected  -- bool, output of DetectTransient()
-        prev_block_type     -- one of {LONG, START, SHORT, STOP}
+        k_attack        -- int, output of DetectTransient(): attack sub-window
+                           index (0..N_SHORT_BLOCKS-1), or -1 if no transient
+        prev_block_type -- one of {LONG, START, SHORT, STOP}
 
     Returns:
         The block type for the current block: one of {LONG, START, SHORT, STOP}
     """
-    if transient_detected:
+    if k_attack >= 0:
         if prev_block_type == LONG:
             return START
         elif prev_block_type == START:
@@ -120,12 +123,11 @@ def SelectBlockType(transient_detected, prev_block_type):
 
 def LongWindowFunc(N):
     """
-    Returns the sine window of length N used for LONG blocks.
+    Returns the KBD window of length N used for LONG blocks (alpha=4).
 
-    w[n] = sin(pi * (n + 0.5) / N)   for n in [0, N)
-
-    This is the same formula as SineWindow in window.py, but written here
-    so the block switcher controls its own windowing independently.
+    AAC uses KBD windows for long blocks instead of sine windows.
+    KBD has much lower spectral sidelobes (~-100 dB vs ~-30 dB for sine),
+    reducing leakage and improving psychoacoustic model accuracy.
 
     Arguments:
         N -- total window length (= 2 * nMDCTLines_long, e.g. 2048)
@@ -133,11 +135,7 @@ def LongWindowFunc(N):
     Returns:
         numpy array of shape (N,)
     """
-    w = np.zeros(N)
-    for n in range(N):
-        w[n] = np.sin(np.pi * (n + 0.5) / N)
-
-    return w
+    return KBDWindow(np.ones(N), alpha=4)
 
 
 def ShortWindowFunc(N_short):
@@ -187,17 +185,16 @@ def StartWindowFunc(N_long, N_short):
     w = np.zeros(N_long)
     pad = (N_long//4 - N_short//4)
 
-    #normal first half of window
-    for n in range(N_long // 2):
-        w[n] = np.sin(np.pi * (n + 0.5) / N_long)
+    # left half: KBD long window (rising side)
+    kbd_long = KBDWindow(np.ones(N_long), alpha=4)
+    w[:N_long//2] = kbd_long[:N_long//2]
 
-    #pad of 1's
-    for n in range(N_long // 2, N_long // 2 +pad):
-        w[n] = 1.0
-    
-    #transition to short first half
+    # flat top
+    w[N_long//2 : N_long//2 + pad] = 1.0
+
+    # taper down with right half of short sine window
     for n in range(N_short//2):
-        w[n+ (N_long//2+pad)] = np.sin(np.pi * ((0.5 + n+N_short//2)/ N_short))
+        w[N_long//2 + pad + n] = np.sin(np.pi * (0.5 + n + N_short//2) / N_short)
 
     return w
 
@@ -227,18 +224,17 @@ def StopWindowFunc(N_long, N_short):
     """
     w = np.zeros(N_long)
     pad = (N_long//4 - N_short//4)
-    
-    #short right side
+
+    # rise with left half of short sine window
     for n in range(N_short//2):
-        w[n+pad] = np.sin(np.pi * (0.5 + n)/N_short)
-    
-    #1's padding
-    for n in range(pad):
-        w[n+N_short//2+pad] = 1.0
-    
-    #long right side
-    for n in range(N_long//2):
-        w[n + N_short//2+pad+pad] = np.sin(np.pi* (n+ N_long//2+ 0.5)/ N_long)
+        w[pad + n] = np.sin(np.pi * (0.5 + n) / N_short)
+
+    # flat top
+    w[N_short//2 + pad : N_long//2] = 1.0
+
+    # right half: KBD long window (falling side)
+    kbd_long = KBDWindow(np.ones(N_long), alpha=4)
+    w[N_long//2:] = kbd_long[N_long//2:]
 
     return w
 
@@ -288,96 +284,129 @@ def ShortBlockSFBands(nMDCTLines_short, sampleRate):
     Returns:
         ScaleFactorBands object appropriate for short-block encoding
     """
-    nLines = np.array([4, 4, 4, 4, 4, 8, 8, 8, 12, 12, 12, 16, 16, 16]) #from AAC short window documentation
+    nLines = np.array([4, 4, 4, 4, 4, 8, 8, 8, 12, 12, 12, 16, 16, 16]) #from AAC short window 
   
     return ScaleFactorBands(nLines)
 
 
 # ---------------------------------------------------------------------------
-# Window grouping (spectral similarity-based)
+# Window grouping (attack-isolation)
 # ---------------------------------------------------------------------------
 
-def _band_log_energy(mdct_lines, sfBands):
-    """
-    Helper: returns a vector of per-band log energies (dB) for a set of MDCT lines.
+GROUPING_BITS = N_SHORT_BLOCKS - 1  # 7 bits to encode group boundaries
 
-    For each scale factor band, sums the squared MDCT coefficients and converts
-    to dB. Bands with zero energy return -inf.
+
+def group_lens_to_mask(group_lens):
+    """
+    Converts a list of group lengths to a 7-bit integer mask.
+
+    Bit i (LSB=0) is set if a new group starts after short window i.
+    For example, group_lens=[3,1,4] means boundaries after windows 2 and 3,
+    giving mask = 0b0001100 = 12.
+
+    mask=0   means all 8 windows in one group (maximum sharing).
+    mask=127 means every window in its own group (no sharing).
 
     Arguments:
-        mdct_lines -- numpy array of nMDCTLines_short MDCT coefficients
-        sfBands    -- ScaleFactorBands object for the short block
+        group_lens -- list of ints summing to N_SHORT_BLOCKS, each giving
+                      the number of windows in that group (e.g. [3, 1, 4])
 
     Returns:
-        numpy array of shape (sfBands.nBands,) with per-band energy in dB
+        7-bit integer mask
     """
-    pass  ### YOUR CODE STARTS HERE ###
+    mask = 0
+    idx = 0
+    for gl in group_lens[:-1]:   # skip last group -- no boundary after it
+        idx += gl                # idx is now the first window of the next group
+        mask |= (1 << (idx - 1)) # so there's a boundary after window (idx-1)
+    return int(mask)
 
 
-def SelectWindowGroups(data, nMDCTLines_short, sampleRate, similarity_threshold=3.0, max_groups=4):
+def mask_to_group_lens(mask):
     """
-    Decides how to group the N_SHORT_BLOCKS short windows for scale factor sharing,
-    based on spectral similarity between adjacent windows.
+    Converts a 7-bit integer mask to a list of group lengths.
 
-    Windows with similar spectral content are grouped together to share scale
-    factors and bit allocations, saving bits without hurting quality. Windows
-    with dissimilar spectra are kept separate so each gets its own scale factors.
+    Inverse of group_lens_to_mask. Reads bits 0-6; each set bit marks a
+    group boundary after that window index. Returns a list of group lengths
+    summing to N_SHORT_BLOCKS.
+
+    Arguments:
+        mask -- 7-bit integer (0 = all one group, 127 = all singletons)
+
+    Returns:
+        list of group lengths, e.g. [3, 1, 4]
+    """
+    group_lens = []
+    current_len = 0
+    for i in range(N_SHORT_BLOCKS - 1):   # bits 0..6
+        current_len += 1
+        if mask & (1 << i):               # boundary after window i
+            group_lens.append(current_len)
+            current_len = 0
+    current_len += 1                      # last window always ends a group
+    group_lens.append(current_len)
+    return group_lens
+
+
+def SelectWindowGroups(k_attack, max_groups=4):
+    """
+    Returns a 7-bit group mask for the N_SHORT_BLOCKS short windows using
+    attack-isolation grouping.
+
+    Isolates the attack window (found by DetectTransient) in its own group,
+    lumping pre-attack and post-attack windows into their own groups.
+    If k_attack == -1 (no attack), returns mask=0 (all 8 windows in one group).
 
     Algorithm:
-        1. Compute the MDCT of each of the N_SHORT_BLOCKS sub-windows in `data`
-           using ShortWindowFunc.
-        2. Compute per-band log energy via _band_log_energy for each window.
-        3. Start with each window as its own singleton group.
-        4. Iteratively merge adjacent groups whose per-band log energy vectors
-           are most similar (lowest mean absolute difference across bands),
-           as long as that difference is below similarity_threshold (in dB)
-           and len(groups) > 1.
-        5. Stop merging when no adjacent pair is below the threshold or
-           len(groups) <= 1. Also respect max_groups as a hard cap.
-
-    The group structure is encoded in the bitstream as a list of group lengths
-    (e.g. [3, 1, 4]) which can be represented in 7 bits (one boundary bit per
-    window 1-7). This is only transmitted when block_type == SHORT.
+        1. If k_attack < 0: return mask=0 (all one group).
+        2. Otherwise isolate the attack window k_attack:
+               pre-attack:  [0 .. k_attack-1]   (omitted if k_attack == 0)
+               attack:      [k_attack]
+               post-attack: [k_attack+1 .. 7]   (omitted if k_attack == 7)
+        3. Merge the smallest group into its smaller neighbor until
+           len(groups) <= max_groups.
+        4. Convert group lengths to mask via group_lens_to_mask and return.
 
     Arguments:
-        data                 -- numpy array of N_long time-domain samples (full
-                                long block, not windowed)
-        nMDCTLines_short     -- number of MDCT lines in a short block (e.g. 128)
-        sampleRate           -- audio sample rate in Hz (e.g. 44100)
-        similarity_threshold -- max mean absolute dB difference between adjacent
-                                groups' spectral profiles to allow merging (default 3.0)
-        max_groups           -- maximum number of groups allowed (default 4)
+        k_attack   -- int, attack sub-window index from DetectTransient(),
+                      or -1 if no transient (returns mask=0)
+        max_groups -- maximum number of groups allowed (default 4)
 
     Returns:
-        groups -- list of lists of window indices, e.g.
-                  [[0,1,2], [3], [4,5,6,7]] means windows 0-2 share one scale
-                  factor set, window 3 has its own, windows 4-7 share one.
-                  No grouping: [[0],[1],[2],[3],[4],[5],[6],[7]]
+        7-bit integer mask (use mask_to_group_lens to recover group lengths)
     """
-    pass  ### YOUR CODE STARTS HERE ###
+    # 1. No attack -> all one group
+    if k_attack < 0:
+        return 0
 
+    # 2. Isolate the attack window
+    groups = []
+    if k_attack > 0:
+        groups.append(k_attack)           # pre-attack group length
+    groups.append(1)                      # attack window alone
+    post = N_SHORT_BLOCKS - k_attack - 1
+    if post > 0:
+        groups.append(post)               # post-attack group length
 
-def GroupedSFBands(groups, nMDCTLines_short, sampleRate):
-    """
-    Returns a list of ScaleFactorBands objects, one per group.
+    # 5. Merge smallest group into its smaller neighbor until <= max_groups
+    while len(groups) > max_groups:
+        # find the smallest group
+        idx = int(np.argmin(groups))
+        if idx == 0:
+            # merge with right neighbor
+            groups[1] += groups[0]
+            groups.pop(0)
+        elif idx == len(groups) - 1:
+            # merge with left neighbor
+            groups[-2] += groups[-1]
+            groups.pop()
+        else:
+            # merge with the smaller of left/right neighbor
+            if groups[idx - 1] <= groups[idx + 1]:
+                groups[idx - 1] += groups[idx]
+            else:
+                groups[idx + 1] += groups[idx]
+            groups.pop(idx)
 
-    Each group shares one scale factor set across all its windows. Since every
-    window still has its own nMDCTLines_short MDCT lines and its own mantissas,
-    the sfBands structure is the same for every group regardless of group size
-    -- it is always built from nMDCTLines_short lines via ShortBlockSFBands.
-
-    In codec.py, for each group you will:
-        - Find the worst-case (max) scale factor across all windows in the group
-          for each band, and transmit that one value
-        - Quantize each window's mantissas using that shared scale factor
-
-    Arguments:
-        groups           -- list of lists of window indices (output of
-                            SelectWindowGroups)
-        nMDCTLines_short -- number of MDCT lines in a single short window
-        sampleRate       -- audio sample rate in Hz
-
-    Returns:
-        list of ScaleFactorBands objects, one per group (len == len(groups))
-    """
-    pass  ### YOUR CODE STARTS HERE ###
+    # 6. Convert to mask
+    return group_lens_to_mask(groups)
