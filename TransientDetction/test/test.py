@@ -5,9 +5,13 @@ import matplotlib.pyplot as plt
 # Fix pycwt compatibility
 import pycwt.helpers
 pycwt.helpers.fft_kwargs = lambda signal: {'n': int(2 ** np.ceil(np.log2(len(signal))))}
-
+if not hasattr(np, 'int'):
+    np.int = int
+    np.float = float
+    np.bool = bool
+    np.complex = complex
 import pycwt
-from MTE_functions import *
+from TD import *
 
 def detectTransients_CWT_auto(audioPath, sr=22050, duration=None, 
                               override_params=None, verbose=True):
@@ -555,17 +559,7 @@ def plotTransientDetection(results, savePath='transient_detection.png'):
 if __name__ == "__main__":
     
     audio_files = [
-        'Samples/CHIME Kick 2017.wav',
-
-        'Samples/C_C5Yangqin_01_541.wav',
-
-        'Samples/Piano_Hard_C4.wav',
-
-        'Samples/String_Pizzicato1_A#.wav',
-
-        'Samples/glockenspiel_192kbps.wav',
-
-        'Samples/castanets_192kbps.wav',
+        'Samples/ringnoord.wav'
     ]
     
     batch_results = batchProcessAudio(audio_files, output_dir='auto_detection_results')
