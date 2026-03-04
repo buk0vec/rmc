@@ -25,6 +25,8 @@ This system detects transient events (attacks, onsets) in audio signals by combi
 <img width="2384" height="1484" alt="glockenspiel_192kbps_detection" src="https://github.com/user-attachments/assets/d2f32764-7286-474d-b248-1bc2ef755d1a" />
 <img width="2384" height="1484" alt="Piano_Hard_C4_detection" src="https://github.com/user-attachments/assets/92a6a633-1444-478e-81eb-9ae83029f083" />
 <img width="2384" height="1484" alt="String_Pizzicato1_A#_detection" src="https://github.com/user-attachments/assets/60aab9d5-f8ac-493e-93b6-f57577f8806d" />
+<img width="2384" height="1482" alt="ringnoord_detection" src="https://github.com/user-attachments/assets/1127e95e-086e-48ef-b927-cfd30580ba1f" />
+
 ### Requirements
 
 ```bash
