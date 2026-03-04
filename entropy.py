@@ -7,7 +7,7 @@ All values treated as unsigned.
 import numpy as np
 from bitpack import *
 
-LAPLACIAN_MAP = [0.125, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2]
+LAPLACIAN_MAP = [0.125, 0.25, 0.5, 0.75, 1, 2, 4, 10]
 
 
 class ExpGolombCoder:
@@ -176,7 +176,7 @@ class RangeCoder:
 class BlockEntropyCoder:
     N_LAP_BITS = 3  # ceil(log2(len(LAPLACIAN_MAP))) = 3
 
-    def __init__(self, block_order: int, codebook_order: int = 4):
+    def __init__(self, block_order: int, codebook_order: int = 5):
         self.coder = RangeCoder(block_order, codebook_order)
 
     def encode_block(
@@ -281,7 +281,7 @@ class BlockEntropyCoder:
 
 
 if __name__ == "__main__":
-    block_order = 9
+    block_order = 14
     coder = RangeCoder(block_order, 5)
     laplacian = coder._normalized_laplacian(1)
     assert np.sum(laplacian) == 1 << block_order

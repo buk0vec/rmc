@@ -1,14 +1,21 @@
-from prepare_materials import pac, rmc
+from prepare_materials import pac, rmc, pacb
 import argparse
 import glob
 from pathlib import Path
 
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--codec", choices=["pac", "rmc"], default="pac",
-                        help="Codec to use: 'pac' (default) or 'rmc' (entropy-coded)")
+    parser.add_argument("--codec", choices=["pac", "rmc", "pacb"], default="pac",
+                        help="Codec to use: 'pac' (default), 'pacb' (pac w/ block switching), or 'rmc' (entropy-coded)")
     args = parser.parse_args()
-    encode = pac if args.codec == "pac" else rmc
+    codecs = {
+        'pac': pac,
+        'pacb': pacb,
+        'rmc': rmc
+    }
+    encode = codecs[args.codec]
 
     reference_files = glob.glob("inputs/*.wav")
     for i, file in enumerate(reference_files):
