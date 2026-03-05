@@ -16,7 +16,7 @@ from quantize import *  # using vectorized versions (to use normal versions, unc
 # used only by Encode
 from psychoac import CalcSMRs  # calculates SMRs for each scale factor band
 from bitalloc import BitAlloc  #allocates bits to scale factor bands given SMRs
-from blockswitching import DetectTransient, SelectBlockType, WindowForBlockType, ShortBlockSFBands, LONG, START, STOP, SHORT, N_SHORT_BLOCKS
+from blockswitching import SelectBlockType, WindowForBlockType, ShortBlockSFBands, LONG, START, STOP, SHORT, N_SHORT_BLOCKS
 
 def Decode(scaleFactor,bitAlloc,mantissa,overallScaleFactor,codingParams):
     """Reconstitutes a single-channel block of encoded data into a block of
@@ -87,12 +87,12 @@ def Encode(data,codingParams):
     mantissa = []
     overallScaleFactor = []
     
-    N = codingParams.nMDCTLines
-    prev_data = data[0][:N]
-    curr_data = data[0][N:]
-    transient = DetectTransient(curr_data, prev_data)
-    codingParams.blockType = SelectBlockType(transient, codingParams.prevBlockType)
+    block_idx = getattr(codingParams, 'blockIndex', 0)
+    transient_map = getattr(codingParams, 'transientBlocks', {})
+    k_attack = transient_map.get(block_idx, -1)
+    codingParams.blockType = SelectBlockType(k_attack, codingParams.prevBlockType)
     codingParams.prevBlockType = codingParams.blockType
+    codingParams.blockIndex = block_idx + 1
     # loop over channels and separately encode each one
     for iCh in range(codingParams.nChannels):
         (s,b,m,o) = EncodeSingleChannel(data[iCh],codingParams)
