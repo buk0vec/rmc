@@ -16,7 +16,7 @@ def EncodeDecode(inFilename="input.wav",
                  nScaleBits=3,
                  nMantSizeBits=4,
                  targetBitsPerSample=2.9,
-                 progressCallback=None):
+                 progressCallback=None, tempo = 120.0):
     """Encodes input WAV file inFilename into perceptually coded file
 codedFilename and then decodes that file into output WAV file outFilename.
 Allowed parameters are the number of indep MDCT lines per block (half the block
@@ -72,6 +72,7 @@ of bits per sample.
             codingParams.nMantSizeBits = nMantSizeBits
             codingParams.targetBitsPerSample = targetBitsPerSample
             codingParams.nSamplesPerBlock = codingParams.nMDCTLines
+            codingParams.tempo = tempo
             # transient map from pre-analysis
             codingParams.transientBlocks = transient_map
             codingParams.blockIndex = 0
@@ -109,7 +110,7 @@ of bits per sample.
 
 
 if __name__ == "__main__":
-    EncodeDecode(inFilename='castanets.wav', codedFilename='coded_128k.pac',
-                 outFilename='output_128k.wav', targetBitsPerSample=128000/44100)
-    EncodeDecode(inFilename='castanets.wav', codedFilename='coded_192k.pac',
-                 outFilename='output_192k.wav', targetBitsPerSample=192000/44100)
+    EncodeDecode(inFilename='Van_124BPM.wav', codedFilename='coded_128k.pac',
+                 outFilename='VANoutput_128k.wav', targetBitsPerSample=128000/44100, tempo =124)
+    EncodeDecode(inFilename='Van_124BPM.wav', codedFilename='coded_192k.pac',
+                 outFilename='VANoutput_192k.wav', targetBitsPerSample=192000/44100, tempo = 124)
