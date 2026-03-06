@@ -67,6 +67,24 @@ def get_search_offsets(time_signature):
 
 
 def get_best_region(input_block, coding_params, buffer, padding=200, threshold=0.8):
+    """
+    Find the best rhythmic prediction region for the input block.
+    
+    Parameters:
+    -----------
+    input_block : np.ndarray
+        2048 samples to encode
+    coding_params : object
+        Contains tempo, sample_rate, etc.
+    buffer : np.ndarray
+        Previous audio history (~1 bar + padding)
+    
+    Returns:
+    --------
+    tuple: (range_type, residual) or (None, None)
+        range_type: str - "quarter", "half", "bar", or None
+        residual: np.ndarray - prediction residual to encode, or None
+    """
     
     original_energy = np.var(input_block)
     
