@@ -1,72 +1,105 @@
 import numpy as np
 
-def get_best_region(input_block, coding_params, buffer, padding=200, threshold=0.8):
+def get_search_offsets(time_signature):
     """
-    Find the best rhythmic prediction region for the input block.
+    Generate meter related search offsets based on meter.
     
     Parameters:
     -----------
-    input_block : np.ndarray
-        2048 samples to encode
-    coding_params : object
-        Contains tempo, sample_rate, etc.
-    buffer : np.ndarray
-        Previous audio history (1 bar + padding)
-    padding : int
-        Search range padding in samples (default: 200)
-    threshold : float
-        MSE threshold ratio for rejecting prediction (default: 0.8)
+    time_signature : tuple
+        (beats_per_bar, beat_unit), e.g., (4, 4), (3, 4), (12, 8), (7, 4)
     
     Returns:
     --------
-    tuple: (range_type, data_to_encode, relative_offset)
-        range_type: str - "quarter", "half", "bar", or None
-        data_to_encode: np.ndarray - residual if prediction used, otherwise input_block
-        relative_offset: int - offset from center (0 if no prediction used)
+    list of int: [num_beat_units, ...]
+        Number of beat units to look backward for each search offset
+
+    Examples:
+    ---------
+    (4, 4) → [1, 2, 4]
+    (3, 4) → [1, 2, 3]
+    (12, 8) → [3, 6, 12]
+    (7, 4) → [1, 2, 3, 7]
     """
+    beats_per_bar, beat_unit = time_signature
+    offsets = []
     
-    # Calculate baseline energy
+    # COMPOUND METERS 
+    if beat_unit == 8 and beats_per_bar % 3 == 0:
+        compound_beats = beats_per_bar // 3
+        
+        # 1 beat (3 eighth notes)
+        offsets.append(3)
+        
+        # 2 beats (6 eighth notes)
+        if compound_beats > 2:
+            offsets.append(6)
+        
+        # Half bar
+        if compound_beats % 2 == 0 and compound_beats > 2:
+            offsets.append(beats_per_bar // 2)
+        
+        # Full bar
+        offsets.append(beats_per_bar)
+    
+    # SIMPLE METERS 
+    else:
+        # 1 beat
+        offsets.append(1)
+        
+        # 2 beats
+        if beats_per_bar >= 2:
+            offsets.append(2)
+        # Half bar
+        if beats_per_bar % 2 == 0:
+            offsets.append(beats_per_bar // 2)
+        elif beats_per_bar > 3:
+            offsets.append(beats_per_bar // 2)
+        
+        # Full bar
+        offsets.append(beats_per_bar)
+    
+
+    offsets = sorted(list(set(offsets)))
+    
+    return offsets
+
+
+
+def get_best_region(input_block, coding_params, buffer, padding=200, threshold=0.8):
+    
     original_energy = np.var(input_block)
     
-    # Calculate temporal parameters
-    samples_per_qn = int((60.0 / coding_params.tempo) * coding_params.sample_rate)
-    block_size = len(input_block)
+    # Get time signature from header
+    time_signature = (coding_params.beats_per_bar, coding_params.beat_unit)
     
-    # Initialize results storage
+    # Calculate samples per beat unit
+    samples_per_quarter_note = int((60.0 / coding_params.tempo) * coding_params.sample_rate)
+    samples_per_beat_unit = int(samples_per_quarter_note * (4.0 / time_signature[1]))
+    
+    block_size = len(input_block)
     results = {}
     
-    # Search each range type
-    range_configs = {
-        'quarter': 1,
-        'half': 2,
-        'bar': 4
-    }
+    # Get adaptive search offsets (now just numbers)
+    search_offsets = get_search_offsets(time_signature)
     
-    for range_type, qn_multiplier in range_configs.items():
+    for beat_units in search_offsets:
         
-        # Determine center offset
-        center_offset = qn_multiplier * samples_per_qn
-        
-        # Define search window
+        center_offset = beat_units * samples_per_beat_unit
         search_start = center_offset - padding
         search_end = center_offset + padding
         
-        # Ensure we don't go out of buffer bounds
         if search_end + block_size > len(buffer):
-            continue  # Skip this range if not enough buffer
+            continue
         
         # Sliding correlation search
         best_correlation = -np.inf
         best_sample_offset = None
         
         for sample_offset in range(search_start, search_end + 1):
-            # Extract candidate region from buffer
             candidate_region = buffer[sample_offset : sample_offset + block_size]
-            
-            # Calculate normalized correlation
             correlation = np.corrcoef(input_block, candidate_region)[0, 1]
             
-            # Track best match
             if correlation > best_correlation:
                 best_correlation = correlation
                 best_sample_offset = sample_offset
@@ -75,12 +108,10 @@ def get_best_region(input_block, coding_params, buffer, padding=200, threshold=0
         predicted_block = buffer[best_sample_offset : best_sample_offset + block_size]
         residual = input_block - predicted_block
         mse = np.mean(residual ** 2)
-        
-        # Calculate relative offset (for block header encoding)
         relative_offset = best_sample_offset - center_offset
         
-        # Store results
-        results[range_type] = {
+        # Use beat_units as key
+        results[beat_units] = {
             'sample_offset': best_sample_offset,
             'relative_offset': relative_offset,
             'residual': residual,
@@ -88,21 +119,16 @@ def get_best_region(input_block, coding_params, buffer, padding=200, threshold=0
             'correlation': best_correlation
         }
     
-    # Check if we found any valid results
     if not results:
-        # No valid search performed, encode input directly
         return (None, input_block, 0)
     
-    # Find best range across all types
-    best_range = min(results.keys(), key=lambda x: results[x]['mse'])
-    best_mse = results[best_range]['mse']
-    best_residual = results[best_range]['residual']
-    best_relative_offset = results[best_range]['relative_offset']
+    # Find best by minimum MSE
+    best_beat_units = min(results.keys(), key=lambda x: results[x]['mse'])
+    best_mse = results[best_beat_units]['mse']
+    best_residual = results[best_beat_units]['residual']
+    best_relative_offset = results[best_beat_units]['relative_offset']
     
-    # Evaluate against threshold
     if best_mse < threshold * original_energy:
-        # Prediction is helpful - encode residual
-        return (best_range, best_residual, best_relative_offset)
+        return (best_beat_units, best_residual, best_relative_offset)
     else:
-        # Prediction doesn't help - encode original input
         return (None, input_block, 0)
