@@ -106,8 +106,8 @@ from bitpack import *  # class for packing data into an array of bytes where eac
 import codec    # module where the actual PAC coding functions reside(this module only specifies the PAC file format)
 from psychoac import ScaleFactorBands, AssignMDCTLinesFromFreqLimits  # defines the grouping of MDCT lines into scale factor bands
 from entropy import BlockEntropyCoder
-from blockswitching import LONG, START, SHORT, STOP, N_SHORT_BLOCKS, ShortBlockSFBands
-from search import get_best_region, PRED_MAP
+from blockswitching import LONG, START, SHORT, STOP, N_SHORT_BLOCKS, ShortBlockSFBands, WindowForBlockType
+from search import INV_PRED_MAP, get_best_region, PRED_MAP
 
 import numpy as np  # to allow conversion of data blocks to numpy's array object
 MAX16BITS = 32767
@@ -157,7 +157,7 @@ class RMCFile(AudioFile):
         myParams.numSamplesHalfBar = int(((60.0/tempo) * sampleRate)*2)
         myParams.numSamplesBar = int(((60.0/tempo) * sampleRate)*4)
         myParams.search_range = 255 #byte per block + 1 for sign bit
-        myParams.search_buffer = [np.zeros(myParams.numSamplesBar + myParams.search_range) for _ in range(myParams.nChannels)]
+        myParams.search_buffer = [np.zeros(myParams.numSamplesBar + myParams.search_range + myParams.nMDCTLines) for _ in range(myParams.nChannels)]
 
         # entropy coders
         myParams.entropyCoder_long = BlockEntropyCoder(14)
@@ -201,7 +201,8 @@ class RMCFile(AudioFile):
             # TODO: can't this just be one bit
             codingParams.blockType = pb.ReadBits(2)
             pred_type = pb.ReadBits(2)
-            if pred_type is not PRED_MAP[None]:
+            pred_offset = 0
+            if pred_type != PRED_MAP[None]:
                 pred_sign = pb.ReadBits(1)
                 pred_offset = pb.ReadBits(8)
                 if pred_sign == 1:
@@ -246,33 +247,32 @@ class RMCFile(AudioFile):
                     pb, bitAlloc, codingParams.sfBands, codingParams.nMDCTLines
                 )
 
-            # (DECODE HERE) decode the unpacked data for this channel, overlap-and-add first half, and append it to the data array (saving other half for next overlap-and-add)
+            # (DECODE HERE) decode the unpacked data for this channel
             decodedData = self.Decode(scaleFactor,bitAlloc,mantissa, overallScaleFactor,codingParams)
+            N = codingParams.nMDCTLines
+            pred_type = INV_PRED_MAP[pred_type]
 
-            if PRED_MAP[pred_type] is not None:
+            # OAA on residual first (prediction applied after, in time domain)
+            output_N = codingParams.overlapAndAdd[iCh] + decodedData[:N]
+            codingParams.overlapAndAdd[iCh] = decodedData[N:]
+
+            # Add N-sample prediction in time domain, after OAA
+            if pred_type is not None:
                 if pred_type == 'quarter':
                     start_offset = codingParams.numSamplesQuarterNote
                 elif pred_type == 'half':
-                    start_offset =  codingParams.numSamplesHalfNote
+                    start_offset = codingParams.numSamplesHalfBar
                 else:
                     start_offset = codingParams.numSamplesBar
+                pred_N = codingParams.search_buffer[iCh][-(start_offset + N) + pred_offset : -(start_offset + N) + pred_offset + N]
+                output_N = output_N + pred_N
 
-                decodedData += codingParams.search_buffer[iCh][-start_offset + pred_offset: -start_offset + pred_offset + 2 * codingParams.nMDCTLines]
+            output_N = np.maximum(-1., np.minimum(1., output_N))
+            data[iCh] = np.concatenate((data[iCh], output_N))
 
-
-            data[iCh] = np.concatenate(
-                ( data[iCh], 
-                 np.maximum( -1., np.minimum( 1.,  # make sure result remains in [-1,1]
-                        np.add( codingParams.overlapAndAdd[iCh],       
-                                decodedData[:codingParams.nMDCTLines]) 
-                            ) ) 
-                 )
-            )# data[iCh] is overlap-and-added data
-            codingParams.overlapAndAdd[iCh] = decodedData[codingParams.nMDCTLines:]  # save other half for next pass
-            codingParams.search_buffer[iCh][0:-codingParams.nMDCTLines] = codingParams.search_buffer[iCh][codingParams.nMDCTLines:] #shift over 1/2 N
-            codingParams.search_buffer[iCh][-codingParams.nMDCTLines:] = 0
-            codingParams.search_buffer[iCh][-2*codingParams.nMDCTLines:] += decodedData
-            codingParams.search_buffer[iCh][-2*codingParams.nMDCTLines] = np.clip(codingParams.search_buffer[iCh][-2*codingParams.nMDCTLines], -1, 1)
+            # Update buffer with N PCM samples directly (no win² OAA)
+            codingParams.search_buffer[iCh][:-N] = codingParams.search_buffer[iCh][N:]
+            codingParams.search_buffer[iCh][-N:] = output_N
 
         # end loop over channels, return signed-fraction samples for this block
         return data
@@ -313,7 +313,10 @@ class RMCFile(AudioFile):
         codingParams.numSamplesHalfBar = int(((60.0/codingParams.tempo) * codingParams.sampleRate)*2)
         codingParams.numSamplesBar = int(((60.0/codingParams.tempo) * codingParams.sampleRate)*4)
         codingParams.search_range = 255 #byte per block + 1 for sign bit
-        codingParams.search_buffer = [np.zeros(codingParams.numSamplesBar + codingParams.search_range) for _ in range(codingParams.nChannels)]
+        codingParams.search_buffer = [np.zeros(codingParams.numSamplesBar + codingParams.search_range + codingParams.nMDCTLines) for _ in range(codingParams.nChannels)]
+        # delayed prediction state: written to bitstream one block late to match 1-block MDCT delay
+        codingParams.prev_ranges  = [None] * codingParams.nChannels
+        codingParams.prev_offsets = [0]    * codingParams.nChannels
 
         self.fp.write(pack('<L',sfBands.nBands))
         self.fp.write(pack('<'+str(sfBands.nBands)+'H',*(sfBands.nLines.tolist()) ))
@@ -323,6 +326,10 @@ class RMCFile(AudioFile):
         for iCh in range(codingParams.nChannels):
             priorBlock.append(np.zeros(codingParams.nMDCTLines,dtype=np.float64) )
         codingParams.priorBlock = priorBlock
+        # encoder-side OAA state (tracks residual overlap, separate from decoder OAA)
+        codingParams.enc_overlapAndAdd = [np.zeros(codingParams.nMDCTLines, dtype=np.float64) for _ in range(codingParams.nChannels)]
+        # prior residual block for building the 2N residual MDCT window
+        codingParams.priorResidualBlock = [np.zeros(codingParams.nMDCTLines, dtype=np.float64) for _ in range(codingParams.nChannels)]
         #initialize prevBlockType
         codingParams.prevBlockType = LONG
         return
@@ -339,32 +346,86 @@ class RMCFile(AudioFile):
             fullBlockData_.append( np.concatenate( ( codingParams.priorBlock[iCh], data[iCh]) ) )
         codingParams.priorBlock = data  # current pass's data is next pass's prior block data
 
+        # Save block-switching state so the second Encode pass uses the same block type
+        _saved_blockIndex   = getattr(codingParams, 'blockIndex', 0)
+        _saved_prevBlockType = codingParams.prevBlockType
+
         # (ENCODE HERE) Encode the full block of multi=channel data
         (scaleFactor,bitAlloc,mantissa, overallScaleFactor) = self.Encode(fullBlockData_,codingParams)  # returns a tuple with all the block-specific info not in the file header
         sfBands_short = ShortBlockSFBands(codingParams.nMDCTLines_short, codingParams.sampleRate)
-    
-        fullBlockData=[]
+
+        # Search for best N-sample prediction for each channel, then build 2N residual blocks
+        fullBlockData = []
         ranges = []
         offsets = []
-        # Decode early for RMC buffer
         for iCh in range(codingParams.nChannels):
-            decodedFullBlockData = self.Decode(scaleFactor[iCh],bitAlloc[iCh],mantissa[iCh], overallScaleFactor[iCh], codingParams)
-            codingParams.search_buffer[iCh][0:-codingParams.nMDCTLines] = codingParams.search_buffer[iCh][codingParams.nMDCTLines:] #shift over 1/2 N
-            codingParams.search_buffer[iCh][-codingParams.nMDCTLines:] = 0  
-            codingParams.search_buffer[iCh][-2*codingParams.nMDCTLines:] += decodedFullBlockData
-            codingParams.search_buffer[iCh][-2*codingParams.nMDCTLines] = np.clip(codingParams.search_buffer[iCh][-2*codingParams.nMDCTLines], -1, 1)
-            best_range, best_residual, best_relative_offset = get_best_region(fullBlockData_[iCh], codingParams, codingParams.search_buffer[iCh], 0.8)
-            fullBlockData.append(best_residual)
+            best_range, residual_N, best_relative_offset = get_best_region(
+                data[iCh], codingParams, codingParams.search_buffer[iCh], 0.8
+            )
+            # Build 2N residual block: [prior_residual | current_residual]
+            fullBlockData.append(np.concatenate((codingParams.priorResidualBlock[iCh], residual_N)))
+            codingParams.priorResidualBlock[iCh] = residual_N.copy()
             offsets.append(best_relative_offset)
             ranges.append(best_range)
 
+        # Restore block-switching state so the second Encode selects the same block type as the first
+        codingParams.blockIndex   = _saved_blockIndex
+        codingParams.prevBlockType = _saved_prevBlockType
         (scaleFactor,bitAlloc,mantissa, overallScaleFactor) = self.Encode(fullBlockData,codingParams)  # returns a tuple with all the block-specific info not in the file header
+        encoded_blockType = codingParams.blockType  # save after second Encode updates it
+
+        # Update search_buffer with second-pass decode + prediction, mirroring the decoder exactly
+        N = codingParams.nMDCTLines
+        for iCh in range(codingParams.nChannels):
+            # Expand second-pass mantissa to full-length array for Decode
+            if encoded_blockType == SHORT:
+                mant_full2 = []
+                for i in range(N_SHORT_BLOCKS):
+                    arr = np.zeros(codingParams.nMDCTLines_short, dtype=np.int32)
+                    iCmp = 0
+                    for iBand in range(sfBands_short.nBands):
+                        nL = sfBands_short.nLines[iBand]
+                        if bitAlloc[iCh][i][iBand]:
+                            arr[sfBands_short.lowerLine[iBand]:sfBands_short.upperLine[iBand]+1] = mantissa[iCh][i][iCmp:iCmp+nL]
+                            iCmp += nL
+                    mant_full2.append(arr)
+            else:
+                mant_full2 = np.zeros(N, dtype=np.int32)
+                iCmp = 0
+                for iBand in range(codingParams.sfBands.nBands):
+                    nL = codingParams.sfBands.nLines[iBand]
+                    if bitAlloc[iCh][iBand]:
+                        mant_full2[codingParams.sfBands.lowerLine[iBand]:codingParams.sfBands.upperLine[iBand]+1] = mantissa[iCh][iCmp:iCmp+nL]
+                        iCmp += nL
+            decoded_residual = self.Decode(scaleFactor[iCh], bitAlloc[iCh], mant_full2, overallScaleFactor[iCh], codingParams)
+
+            # Encoder-side OAA on residual only (mirrors decoder, prediction applied after)
+            enc_out_N = codingParams.enc_overlapAndAdd[iCh] + decoded_residual[:N]
+            codingParams.enc_overlapAndAdd[iCh] = decoded_residual[N:].copy()
+
+            # Add PREVIOUS block's prediction (delayed by 1 block to match the MDCT output delay:
+            # OAA of block k gives residual_{k-1}, so we need pred_{k-1} to reconstruct data_{k-1}).
+            # The buffer has shifted N samples since prev_offsets was found, so index by -(start+N).
+            if codingParams.prev_ranges[iCh] is not None:
+                if codingParams.prev_ranges[iCh] == 'quarter':
+                    start_offset = codingParams.numSamplesQuarterNote
+                elif codingParams.prev_ranges[iCh] == 'half':
+                    start_offset = codingParams.numSamplesHalfBar
+                else:
+                    start_offset = codingParams.numSamplesBar
+                pred_N = codingParams.search_buffer[iCh][-(start_offset + N) + codingParams.prev_offsets[iCh] : -(start_offset + N) + codingParams.prev_offsets[iCh] + N]
+                enc_out_N = enc_out_N + pred_N
+
+            enc_out_N = np.clip(enc_out_N, -1., 1.)
+            # Slide buffer and store N PCM samples directly (no win² OAA)
+            codingParams.search_buffer[iCh][:-N] = codingParams.search_buffer[iCh][N:]
+            codingParams.search_buffer[iCh][-N:] = enc_out_N
 
         # for each channel, write the data to the output file
         for iCh in range(codingParams.nChannels):
             entropy_pbs = []
             nBits = 4 # the 2 addition for window type block switching + 2 bits for prediction
-            if ranges[iCh] is not None:
+            if codingParams.prev_ranges[iCh] is not None:
                 nBits += 9
             if codingParams.blockType == SHORT:
                 for i in range(N_SHORT_BLOCKS):
@@ -396,11 +457,11 @@ class RMCFile(AudioFile):
             pb = PackedBits()
             pb.Size(nBytes)
             pb.WriteBits(codingParams.blockType,2)
-            pb.WriteBits(PRED_MAP[ranges[iCh]], 2)
-            if ranges[iCh] is not None: 
-                sign = 1 if offsets[iCh] < 0 else 0
+            pb.WriteBits(PRED_MAP[codingParams.prev_ranges[iCh]], 2)
+            if codingParams.prev_ranges[iCh] is not None:
+                sign = 1 if codingParams.prev_offsets[iCh] < 0 else 0
                 pb.WriteBits(sign, 1)
-                pb.WriteBits(offsets[iCh], 8)
+                pb.WriteBits(abs(codingParams.prev_offsets[iCh]), 8)
 
             if codingParams.blockType == SHORT:
                 for i in range(N_SHORT_BLOCKS):
@@ -426,6 +487,9 @@ class RMCFile(AudioFile):
                 pb.WriteBits(entropy_pb.buffer, entropy_pb.nBits)
             self.fp.write(pb.GetPackedData())
         # end loop over channels, done writing coded data for all channels
+        # advance delayed prediction state for next block
+        codingParams.prev_ranges  = ranges
+        codingParams.prev_offsets = offsets
         return
 
     def Close(self,codingParams):

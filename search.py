@@ -7,6 +7,13 @@ PRED_MAP = {
     "bar": 3
 }
 
+INV_PRED_MAP = {
+    0: None,
+    1: "quarter",
+    2: "half",
+    3: "bar"
+}
+
 def get_best_region(input_block, coding_params, buffer, threshold=0.8):
     """
     Find the best rhythmic prediction region for the input block.
@@ -56,39 +63,42 @@ def get_best_region(input_block, coding_params, buffer, threshold=0.8):
         # Determine center offset
         center_offset = qn_multiplier
         
-        # Define search window
-        search_start = center_offset - padding
-        search_end = center_offset + padding
-        
+        # Define search window using negative indices from end of buffer
+        # -center_offset is the nominal prediction point (e.g. exactly 1 quarter note ago)
+        search_start = -center_offset - padding
+        search_end = -center_offset + padding
+
         # Ensure we don't go out of buffer bounds
-        if search_end + block_size > len(buffer):
-            continue  # Skip this range if not enough buffer
-        
+        if search_start < -len(buffer):
+            continue  # Skip this range if not enough history in buffer
+
         # Sliding correlation search
         best_correlation = -np.inf
         best_sample_offset = None
-        
+
         for sample_offset in range(search_start, search_end + 1):
             # Extract candidate region from buffer
             candidate_region = buffer[sample_offset : sample_offset + block_size]
-            
+
             # Calculate normalized correlation
             correlation = np.corrcoef(input_block, candidate_region)[0, 1]
             # Track best match
             if correlation > best_correlation:
                 best_correlation = correlation
                 best_sample_offset = sample_offset
-        
-        if best_sample_offset == None: # If it sucks make sure there's a default
-            best_sample_offset = 0
+
+        if best_sample_offset is None:
+            best_sample_offset = -center_offset
 
         # Calculate residual and MSE
         predicted_block = buffer[best_sample_offset : best_sample_offset + block_size]
         residual = input_block - predicted_block
         mse = np.mean(residual ** 2)
-        
-        # Calculate relative offset (for block header encoding)
-        relative_offset = best_sample_offset - center_offset
+
+        # Calculate relative offset from nominal center for block header encoding.
+        # Decoder reconstructs as buffer[-start_offset + relative_offset], so
+        # relative_offset = best_sample_offset + center_offset gives the same index.
+        relative_offset = best_sample_offset + center_offset
         
         # Store results
         results[range_type] = {
