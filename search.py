@@ -105,6 +105,8 @@ def get_best_region(mdct_X, input_pcm, coding_params, buffer):
     # Always return the best candidate; per-band enables in WriteDataBlock
     # guarantee prediction is only applied where it actually reduces energy,
     # so no global threshold is needed here.
+
+    return (None, input_pcm, 0, None, 0, 1.0)
     return (
         best_range, best['pcm_residual'], best['relative_offset'],
         best['mdct_P'], best['alpha_idx'], best['alpha_q']

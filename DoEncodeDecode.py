@@ -2,19 +2,19 @@
 2026 copyrights Marina Bosi & Rich Goldberg
 """
 import time  # just for printing elapsed time
-from TransientDetction import detect_transient_blocks
+# from TransientDetction import detect_transient_blocks
 import numpy as np
 from scipy.io import wavfile
 from rmcfile import *  # to get access to RMC file handling
 from pcmfile import *  # to get access to WAV file handling
-
+from simple_run import detectTransients
 
 def EncodeDecode(inFilename="input.wav",
                  outFilename="output.wav",
                  codedFilename="coded.pac",
                  nMDCTLines=1024,
                  nScaleBits=3,
-                 nMantSizeBits=4,
+                 nMantSizeBits=5,
                  targetBitsPerSample=2.9,
                  progressCallback=None, tempo = 120.0):
     """Encodes input WAV file inFilename into perceptually coded file
@@ -32,20 +32,11 @@ of bits per sample.
     # ------------------------------------------------------------------
     # Pre-analysis: detect transients across the whole song before encoding
     # ------------------------------------------------------------------
-    print("\n\tPre-analyzing audio for transient detection...", end="", flush=True)
-    sr_pre, audio_pre = wavfile.read(inFilename)
-    # wavfile returns shape (nSamples,) for mono or (nSamples, nChannels) for stereo
-    # normalize to [-1, 1] if integer PCM before converting to float
-    if audio_pre.dtype not in (np.float32, np.float64):
-        audio_pre = audio_pre / (2 ** 15)
-    if audio_pre.ndim == 1:
-        audio_pre = np.vstack([audio_pre.astype(np.float64), audio_pre.astype(np.float64)])
-    else:
-        audio_pre = audio_pre.T.astype(np.float64)  # -> (nChannels, nSamples)
+    
 
-    # transient_map = {}  # DEBUG: disable transient detection
-    transient_map = detect_transient_blocks(audio_pre, sr_pre, nMDCTLines)
-    del audio_pre  # free memory before encoding
+    transient_map = detectTransients(inFilename)
+    transient_map = {x:0 for x in transient_map}
+    
     print(f" found transients in {len(transient_map)} blocks")
 
     # ------------------------------------------------------------------
