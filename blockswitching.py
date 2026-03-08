@@ -106,7 +106,7 @@ def SelectBlockType(k_attack, prev_block_type):
         elif prev_block_type == SHORT:
             return SHORT
         elif prev_block_type == STOP:
-            return LONG
+            return START  # new transient during STOP: go back to START rather than inserting an unprotected LONG
     else:
         if prev_block_type == SHORT:
             return STOP

@@ -281,7 +281,7 @@ class RMCFile(AudioFile):
                 if 0 <= seg_start and seg_start + N <= len(buf):
                     candidate = buf[seg_start : seg_start + N]
                     if codingParams.blockType != SHORT:
-                        window = WindowForBlockType(LONG, N, N_short)
+                        window = WindowForBlockType(codingParams.blockType, N, N_short)
                         mdct_P_raw = MDCT(window * candidate, halfN, halfN)[:halfN]
                         enable_mask = np.zeros(halfN)
                         if pred_enable_flags is not None:
@@ -462,7 +462,7 @@ class RMCFile(AudioFile):
         pred_bits_freed = []    # bits to subtract from budget due to prediction
         for iCh in range(codingParams.nChannels):
             if current_block_type != SHORT:
-                window = WindowForBlockType(LONG, N, N_short)
+                window = WindowForBlockType(current_block_type, N, N_short)
                 mdct_X = MDCT(window * fullBlockData_[iCh], halfN, halfN)[:halfN]
                 range_type, pcm_residual, rel_offset, mdct_P, alpha_idx, alpha_q = get_best_region(
                     mdct_X, fullBlockData_[iCh], codingParams,
