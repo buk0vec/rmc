@@ -33,7 +33,8 @@ N_SHORT_BLOCKS = 8
 # Transient detection
 # ---------------------------------------------------------------------------
 
-def DetectTransient(data, prev_data, threshold=10.0):
+
+def DetectTransient(data, prev_data, threshold=25.0):
     """
     Detects whether a transient (sudden amplitude increase) occurs in `data`.
 

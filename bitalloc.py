@@ -92,31 +92,31 @@ def BitAlloc(bitBudget, maxMantBits, nBands, nLines, SMR):
             break
     
     # Greedily add bits until we need to start taking them away
-    incrementable = np.argwhere((bits != 0) & (bits != maxMantBits))[::-1]
-    if bits_remaining >= np.min(nLines[incrementable]):
-        while bits_remaining >= np.min(nLines[incrementable]):
-            incrementable = np.argwhere((bits != 0) & (bits != maxMantBits))[::-1]
-            for idx in incrementable:
-                if bits_remaining >= nLines[idx] and ((bits_remaining - nLines[idx]) >= np.min(nLines) or bits_remaining - nLines[idx] == 0):
-                    bits[idx] += 1
-                    bits_remaining -= nLines[idx]
+    # incrementable = np.argwhere((bits != 0) & (bits != maxMantBits))[::-1]
+    # if bits_remaining >= np.min(nLines[incrementable]):
+    #     while bits_remaining >= np.min(nLines[incrementable]):
+    #         incrementable = np.argwhere((bits != 0) & (bits != maxMantBits))[::-1]
+    #         for idx in incrementable:
+    #             if bits_remaining >= nLines[idx] and ((bits_remaining - nLines[idx]) >= np.min(nLines) or bits_remaining - nLines[idx] == 0):
+    #                 bits[idx] += 1
+    #                 bits_remaining -= nLines[idx]
                     
     # Worst case when we can't easily just chuck bits places
-    if bits_remaining > 0:
-        incrementable = np.argwhere((bits != 0) & (bits != maxMantBits)).flatten()
-        decrementable = np.argwhere((bits > 2)).flatten()
-        found = False
-        for idx_inc in incrementable:
-            for idx_dec in decrementable:
-                if idx_inc != idx_dec:
-                    if nLines[idx_inc] - nLines[idx_dec] == bits_remaining:
-                        bits[idx_inc] += 1
-                        bits[idx_dec] -= 1
-                        bits_remaining -= nLines[idx_inc] - nLines[idx_dec]
-                        found = True
-                        break
-            if found:
-                break
+    # if bits_remaining > 0:
+    #     incrementable = np.argwhere((bits != 0) & (bits != maxMantBits)).flatten()
+    #     decrementable = np.argwhere((bits > 2)).flatten()
+    #     found = False
+    #     for idx_inc in incrementable:
+    #         for idx_dec in decrementable:
+    #             if idx_inc != idx_dec:
+    #                 if nLines[idx_inc] - nLines[idx_dec] == bits_remaining:
+    #                     bits[idx_inc] += 1
+    #                     bits[idx_dec] -= 1
+    #                     bits_remaining -= nLines[idx_inc] - nLines[idx_dec]
+    #                     found = True
+    #                     break
+    #         if found:
+    #             break
             
     # Sometimes we are left w/ some leftover bits. Could do the loop above a few more times to get rid of em, but I'm running out of time!
         

@@ -245,14 +245,12 @@ def analyzeAudioCharacteristics(audioData, sr):
     # 3. Calculate RMS energy
     rms = librosa.feature.rms(y=audio_mono)[0]
     
-    # 4. Estimate onset density using librosa - FIXED
+    # 4. Estimate onset density using librosa 
     onset_env = librosa.onset.onset_strength(y=audio_mono, sr=sr)
-    # Fix: pass y parameter instead of onset_strength
     onset_frames = librosa.onset.onset_detect(y=audio_mono, sr=sr)
     onset_density = len(onset_frames) / (len(audio_mono) / sr)  # onsets per second
     
     # 5. Calculate temporal characteristics
-    # Find decay time (how long signal takes to decay to 10% of peak)
     abs_audio = np.abs(audio_mono)
     peak_val = np.max(abs_audio)
     peak_idx = np.argmax(abs_audio)
@@ -268,22 +266,37 @@ def analyzeAudioCharacteristics(audioData, sr):
     
     decay_time_ms = (decay_samples / sr) * 1000
     
+    # NEW: Calculate compression/dynamic range
+    rms_variability = np.std(rms) / (np.mean(rms) + 1e-6)
+    dynamic_range_db = 20 * np.log10((np.max(abs_audio) + 1e-6) / (np.mean(abs_audio) + 1e-6))
+    
     # 6. Determine audio type based on characteristics
     audio_type = "unknown"
     
-    if onset_density > 5:  # More than 5 onsets per second
-        audio_type = "percussive_rapid"  # Castanets, hi-hats, etc.
+    # NEW: Detect compressed electronic music
+    if rms_variability < 0.5 and onset_density > 3 and dynamic_range_db < 20:
+        audio_type = "electronic_compressed"  # Dense techno/EDM
+    elif onset_density > 5:
+        audio_type = "percussive_rapid"
     elif decay_time_ms < 100:
-        audio_type = "percussive_short"  # Kick, snare
+        audio_type = "percussive_short"
     elif avg_centroid > 2000 and decay_time_ms > 200:
-        audio_type = "plucked_sustained"  # Yangqin, guitar, pizzicato
+        audio_type = "plucked_sustained"
     elif decay_time_ms > 500:
-        audio_type = "sustained"  # Long notes
+        audio_type = "sustained"
     else:
         audio_type = "general"
     
     # 7. Set parameters based on audio type
     param_presets = {
+        "electronic_compressed": {
+            "cwt_onset_threshold": 0.65,      # Much higher - only strong kicks/snares
+            "cwt_min_distance_ms": 100,        # Longer distance - avoid hi-hat spam
+            "cwt_freq_weight": 1.3,            # Less freq weighting (bass-heavy)
+            "time_threshold_factor": 0.45,     # Higher - avoid noise triggering
+            "blockSize": 1024,                 # Larger blocks for stability
+            "steepness_samples": 3             # Keep short for compressed onsets
+        },
         "percussive_rapid": {
             "cwt_onset_threshold": 0.35,
             "cwt_min_distance_ms": 15,
@@ -318,6 +331,34 @@ def analyzeAudioCharacteristics(audioData, sr):
             "cwt_freq_weight": 1.8,
             "time_threshold_factor": 0.33,
             "blockSize": 1024
+        }
+    }
+    
+    params = param_presets[audio_type].copy()
+    
+    # Fine-tune based on specific measurements
+    if onset_density > 10:
+        params["cwt_min_distance_ms"] = max(10, params["cwt_min_distance_ms"] * 0.5)
+    elif onset_density < 1:
+        params["cwt_min_distance_ms"] = min(200, params["cwt_min_distance_ms"] * 1.5)
+    
+    if avg_centroid > 3000:
+        params["cwt_freq_weight"] = min(3.0, params["cwt_freq_weight"] * 1.2)
+    elif avg_centroid < 1000:
+        params["cwt_freq_weight"] = max(1.0, params["cwt_freq_weight"] * 0.8)
+    
+    # Return analysis info along with parameters
+    return {
+        "params": params,
+        "audio_type": audio_type,
+        "characteristics": {
+            "spectral_centroid_hz": avg_centroid,
+            "zero_crossing_rate": avg_zcr,
+            "onset_density_per_sec": onset_density,
+            "decay_time_ms": decay_time_ms,
+            "duration_sec": len(audio_mono) / sr,
+            "rms_variability": rms_variability,
+            "dynamic_range_db": dynamic_range_db
         }
     }
     

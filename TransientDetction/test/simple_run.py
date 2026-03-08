@@ -1,5 +1,5 @@
 import numpy as np
-import librosa
+import scipy
 
 # Fix pycwt compatibility
 import pycwt.helpers
@@ -64,7 +64,26 @@ def detectTransients(audioPath, sr=22050, duration=None,
     numpy array : Combined transient block indices
     """
     # Load audio
-    audioData, sr = librosa.load(audioPath, mono=False, sr=sr, duration=duration)
+    audioData, sr = scipy.io.wavfile.read(audioPath)
+    if audioData.dtype == 'int16':
+        # For 16-bit audio, the max value is 2**15 - 1 (or 2**15 for scaling range)
+        max_val = float(2**15)
+    elif audioData.dtype == 'int32':
+        # For 32-bit audio, the max value is 2**31 - 1
+        max_val = float(2**31)
+    elif audioData.dtype == 'float32' or audioData.dtype == 'float64':
+        # If the file is already float PCM, no scaling is typically needed
+        # (values are usually within -1.0 to 1.0, though can exceed in file)
+        max_val = 1.0
+    else:
+        # Handle other cases like 8-bit, 24-bit, etc.
+        print(f"Unsupported data type for scaling: {audioData.dtype}")
+        max_val = 1.0 # Default to 1.0 if unsure or not scaling
+
+    # 3. Convert and scale the data to a float array in the range [-1.0, 1.0]
+    # Use float64 for better precision during calculations
+    audioData = audioData.astype(np.float64) / max_val
+
     if audioData.ndim == 1:
         audioData = np.vstack([audioData, audioData])
     
@@ -130,7 +149,7 @@ if __name__ == "__main__":
     # Multiple files with auto params
     print("\n" + "="*70)
     audio_files = [
-        'Samples/ringnoord.wav',
+        'Van_124.wav',
     ]
     
     for file in audio_files:

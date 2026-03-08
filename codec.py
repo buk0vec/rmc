@@ -16,9 +16,9 @@ from quantize import *  # using vectorized versions (to use normal versions, unc
 # used only by Encode
 from psychoac import CalcSMRs  # calculates SMRs for each scale factor band
 from bitalloc import BitAlloc  #allocates bits to scale factor bands given SMRs
-from blockswitching import SelectBlockType, WindowForBlockType, ShortBlockSFBands, LONG, START, STOP, SHORT, N_SHORT_BLOCKS
+from blockswitching import SelectBlockType, WindowForBlockType, ShortBlockSFBands, LONG, SHORT, N_SHORT_BLOCKS
 
-def Decode(scaleFactor,bitAlloc,mantissa,overallScaleFactor,codingParams):
+def Decode(scaleFactor,bitAlloc,mantissa,overallScaleFactor,codingParams,mdct_pred=None):
     """Reconstitutes a single-channel block of encoded data into a block of
     signed-fraction data based on the parameters in a PACFile object"""
 
@@ -52,6 +52,8 @@ def Decode(scaleFactor,bitAlloc,mantissa,overallScaleFactor,codingParams):
                     mdctLine[iMant:(iMant+nLines)]=vDequantize(sf[iBand], mant[iMant:(iMant+nLines)],codingParams.nScaleBits, ba[iBand])
                 iMant += nLines
             mdctLine /= rescaleLevel  # put overall gain back to original level
+            if mdct_pred is not None:  # mdct_pred is a list of per-sub-block arrays for SHORT
+                mdctLine += mdct_pred[i]
                 # IMDCT and window the data for this channel
             data = WindowForBlockType(codingParams.blockType, N_long, N_short) * IMDCT(mdctLine, halfN, halfN) # takes in halfN MDCT coeffs
             overlap_and_add[pad + i*halfN_short : pad + i*halfN_short + N_short] += data
@@ -70,6 +72,8 @@ def Decode(scaleFactor,bitAlloc,mantissa,overallScaleFactor,codingParams):
                 mdctLine[iMant:(iMant+nLines)]=vDequantize(scaleFactor[iBand], mantissa[iMant:(iMant+nLines)],codingParams.nScaleBits, bitAlloc[iBand])
             iMant += nLines
         mdctLine /= rescaleLevel  # put overall gain back to original level
+        if mdct_pred is not None:
+            mdctLine += mdct_pred
         # IMDCT and window the data for this channel
         data = WindowForBlockType(codingParams.blockType, N_long, N_short) * IMDCT(mdctLine, halfN, halfN)
 
@@ -78,6 +82,20 @@ def Decode(scaleFactor,bitAlloc,mantissa,overallScaleFactor,codingParams):
 
 
     
+
+
+def ExpandMantissa(mantissa_compact, bitAlloc, sfBands, halfN):
+    """Expand compact mantissa (allocated bands only) to full-length array of size halfN."""
+    mantissa_full = np.zeros(halfN, dtype=np.int32)
+    iCompact = 0
+    iFull = 0
+    for iBand in range(sfBands.nBands):
+        nLines = sfBands.nLines[iBand]
+        if bitAlloc[iBand]:
+            mantissa_full[iFull:iFull+nLines] = mantissa_compact[iCompact:iCompact+nLines]
+            iCompact += nLines
+        iFull += nLines
+    return mantissa_full
 
 
 def Encode(data,codingParams):
@@ -94,7 +112,13 @@ def Encode(data,codingParams):
     codingParams.prevBlockType = codingParams.blockType
     codingParams.blockIndex = block_idx + 1
     # loop over channels and separately encode each one
+    masking_signals = getattr(codingParams, 'masking_signals', None)
+    mdct_corrections = getattr(codingParams, 'mdct_pred_corrections', None)
+    pred_bits_freed = getattr(codingParams, 'pred_bits_freed', None)
     for iCh in range(codingParams.nChannels):
+        codingParams._masking_signal = masking_signals[iCh] if masking_signals is not None else None
+        codingParams._mdct_pred_correction = mdct_corrections[iCh] if mdct_corrections is not None else None
+        codingParams._pred_bits_freed = pred_bits_freed[iCh] if pred_bits_freed is not None else 0.0
         (s,b,m,o) = EncodeSingleChannel(data[iCh],codingParams)
         scaleFactor.append(s)
         bitAlloc.append(b)
@@ -146,8 +170,10 @@ def EncodeSingleChannel(data,codingParams):
             mdctLines *= (1<<overallScale)
 
             # compute the mantissa bit allocations
-            # compute SMRs in side chain FFT
-            SMRs = CalcSMRs(timeSamples, mdctLines, overallScale, codingParams.sampleRate, sfBands_short)
+            # compute SMRs in side chain FFT (use original signal for masking if available)
+            masking_signal = getattr(codingParams, '_masking_signal', None)
+            masking_samples = masking_signal[pad + i*halfN : pad + i*halfN + N] if masking_signal is not None else timeSamples
+            SMRs = CalcSMRs(masking_samples, mdctLines, overallScale, codingParams.sampleRate, sfBands_short)
             # perform bit allocation using SMR results
             bitAlloc = BitAlloc(bitBudget, maxMantBits, sfBands_short.nBands, sfBands_short.nLines, SMRs)
 
@@ -184,6 +210,9 @@ def EncodeSingleChannel(data,codingParams):
         bitBudget = codingParams.targetBitsPerSample * halfN  # this is overall target bit rate
         bitBudget -=  nScaleBits*(sfBands_long.nBands +1)  # less scale factor bits (including overall scale factor)
         bitBudget -= codingParams.nMantSizeBits*sfBands_long.nBands  # less mantissa bit allocation bits
+        # prediction savings: each dB of residual reduction frees 1/6 bit per line
+        bitBudget -= int(getattr(codingParams, '_pred_bits_freed', 0.0))
+        bitBudget = max(bitBudget, 0)
 
 
         # window data for side chain FFT and also window and compute MDCT
@@ -191,14 +220,22 @@ def EncodeSingleChannel(data,codingParams):
         mdctTimeSamples = WindowForBlockType(codingParams.blockType, N_long, N_short) * timeSamples
         mdctLines = MDCT(mdctTimeSamples, halfN, halfN)[:halfN]
 
+        # per-band prediction correction: cancel subtraction in non-enabled bands
+        # mdctLines = (X - alpha_q*P) + alpha_q*P*(1-enable_mask) = X - alpha_q*P*enable_mask
+        correction = getattr(codingParams, '_mdct_pred_correction', None)
+        if correction is not None:
+            mdctLines = mdctLines + correction
+
         # compute overall scale factor for this block and boost mdctLines using it
         maxLine = np.max( np.abs(mdctLines) )
         overallScale = ScaleFactor(maxLine,nScaleBits)  #leading zeroes don't depend on nMantBits
         mdctLines *= (1<<overallScale)
 
         # compute the mantissa bit allocations
-        # compute SMRs in side chain FFT
-        SMRs = CalcSMRs(timeSamples, mdctLines, overallScale, codingParams.sampleRate, sfBands_long)
+        # compute SMRs in side chain FFT (use original signal for masking if available)
+        masking_signal = getattr(codingParams, '_masking_signal', None)
+        masking_samples = masking_signal if masking_signal is not None else timeSamples
+        SMRs = CalcSMRs(masking_samples, mdctLines, overallScale, codingParams.sampleRate, sfBands_long)
         # perform bit allocation using SMR results
         bitAlloc = BitAlloc(bitBudget, maxMantBits, sfBands_long.nBands, sfBands_long.nLines, SMRs)
 

@@ -2,11 +2,11 @@
 2026 copyrights Marina Bosi & Rich Goldberg
 """
 import time  # just for printing elapsed time
+from TransientDetction import detect_transient_blocks
 import numpy as np
 from scipy.io import wavfile
 from rmcfile import *  # to get access to RMC file handling
 from pcmfile import *  # to get access to WAV file handling
-from TransientDetction import detect_transient_blocks
 
 
 def EncodeDecode(inFilename="input.wav",
@@ -43,6 +43,7 @@ of bits per sample.
     else:
         audio_pre = audio_pre.T.astype(np.float64)  # -> (nChannels, nSamples)
 
+    # transient_map = {}  # DEBUG: disable transient detection
     transient_map = detect_transient_blocks(audio_pre, sr_pre, nMDCTLines)
     del audio_pre  # free memory before encoding
     print(f" found transients in {len(transient_map)} blocks")
@@ -110,7 +111,7 @@ of bits per sample.
 
 
 if __name__ == "__main__":
-    EncodeDecode(inFilename='Van_124BPM.wav', codedFilename='coded_128k.pac',
-                 outFilename='VANoutput_128k.wav', targetBitsPerSample=128000/44100, tempo =124)
-    EncodeDecode(inFilename='Van_124BPM.wav', codedFilename='coded_192k.pac',
-                 outFilename='VANoutput_192k.wav', targetBitsPerSample=192000/44100, tempo = 124)
+    EncodeDecode(inFilename='Van_124.wav', codedFilename='coded_128k_ms.pac',
+                 outFilename='VANoutput_128k_ms.wav', targetBitsPerSample=128000/44100, tempo =124)
+    EncodeDecode(inFilename='Van_124.wav', codedFilename='coded_192k_ms.pac',
+                 outFilename='VANoutput_192k_ms.wav', targetBitsPerSample=192000/44100, tempo = 124)
