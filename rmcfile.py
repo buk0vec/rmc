@@ -106,7 +106,7 @@ from bitpack import *  # class for packing data into an array of bytes where eac
 import codec    # module where the actual PAC coding functions reside(this module only specifies the PAC file format)
 from psychoac import ScaleFactorBands, AssignMDCTLinesFromFreqLimits  # defines the grouping of MDCT lines into scale factor bands
 from entropy import BlockEntropyCoder
-from blockswitching import LONG, SHORT, N_SHORT_BLOCKS, ShortBlockSFBands, WindowForBlockType
+from blockswitching import LONG, SHORT, N_SHORT_BLOCKS, ShortBlockSFBands, WindowForBlockType, mask_to_group_lens
 from mdct import MDCT, IMDCT
 from search import get_best_region, PRED_MAP, GAIN_TABLE
 
@@ -229,25 +229,30 @@ class RMCFile(AudioFile):
                                          for _ in range(codingParams.sfBands.nBands)]
 
             if codingParams.blockType == SHORT:
+                grouping_mask = pb.ReadBits(7)
+                group_lens = mask_to_group_lens(grouping_mask)
                 overallScaleFactor = []
                 scaleFactor = []
                 bitAlloc = []
                 mantissa = []
-                for i in range(N_SHORT_BLOCKS):
-                    overallScaleFactor.append(pb.ReadBits(codingParams.nScaleBits))
-                    sf_i = []
-                    ba_i = []
+                for G in group_lens:
+                    # Read shared ba/sf once for this group
+                    shared_ba = []
+                    shared_sf = []
                     for iBand in range(sfBands_short.nBands):
                         ba = pb.ReadBits(codingParams.nMantSizeBits)
                         if ba: ba += 1
-                        ba_i.append(ba)
-                        sf_i.append(pb.ReadBits(codingParams.nScaleBits))
-                    mant_i = codingParams.entropyCoder_short.decode_block(
-                        pb, ba_i, sfBands_short, codingParams.nMDCTLines_short
-                    )
-                    scaleFactor.append(sf_i)
-                    bitAlloc.append(ba_i)
-                    mantissa.append(mant_i)
+                        shared_ba.append(ba)
+                        shared_sf.append(pb.ReadBits(codingParams.nScaleBits))
+                    # Read per-sub-block ovs + entropy mantissas
+                    for g in range(G):
+                        overallScaleFactor.append(pb.ReadBits(codingParams.nScaleBits))
+                        mant_i = codingParams.entropyCoder_short.decode_block(
+                            pb, shared_ba, sfBands_short, codingParams.nMDCTLines_short
+                        )
+                        scaleFactor.append(shared_sf)
+                        bitAlloc.append(shared_ba)
+                        mantissa.append(mant_i)
             else:
                 overallScaleFactor = pb.ReadBits(codingParams.nScaleBits)
                 scaleFactor = []
@@ -617,15 +622,22 @@ class RMCFile(AudioFile):
                 if codingParams.blockType == LONG:
                     nBits += codingParams.sfBands.nBands  # per-band enables only for LONG
             if codingParams.blockType == SHORT:
-                for i in range(N_SHORT_BLOCKS):
-                    entropy_pb = codingParams.entropyCoder_short.encode_block(
-                        mantissa[iCh][i], bitAlloc[iCh][i], sfBands_short
-                    )
-                    entropy_pbs.append(entropy_pb)
-                    nBits += codingParams.nScaleBits
+                group_lens = codingParams.group_lens
+                nBits += 7  # grouping mask
+                sub_idx = 0
+                for G in group_lens:
+                    # Shared sf/ba written once per group
                     for iBand in range(sfBands_short.nBands):
                         nBits += codingParams.nMantSizeBits + codingParams.nScaleBits
-                    nBits += entropy_pb.nBits
+                    # Per sub-block: overallScale + entropy mantissas
+                    for g in range(G):
+                        entropy_pb = codingParams.entropyCoder_short.encode_block(
+                            mantissa[iCh][sub_idx + g], bitAlloc[iCh][sub_idx + g], sfBands_short
+                        )
+                        entropy_pbs.append(entropy_pb)
+                        nBits += codingParams.nScaleBits  # overallScaleFactor
+                        nBits += entropy_pb.nBits
+                    sub_idx += G
             else:
                 entropy_pb = codingParams.entropyCoder_long.encode_block(
                     mantissa[iCh], bitAlloc[iCh], codingParams.sfBands
@@ -654,14 +666,22 @@ class RMCFile(AudioFile):
                         pb.WriteBits(1 if enable_flags_list[iCh][iBand] else 0, 1)
 
             if codingParams.blockType == SHORT:
-                for i in range(N_SHORT_BLOCKS):
-                    pb.WriteBits(overallScaleFactor[iCh][i], codingParams.nScaleBits)
+                pb.WriteBits(codingParams.grouping_mask, 7)
+                ep_idx = 0
+                sub_idx = 0
+                for G in group_lens:
+                    # Write shared ba/sf once per group (use sub_idx; all in group are identical)
                     for iBand in range(sfBands_short.nBands):
-                        ba = bitAlloc[iCh][i][iBand]
+                        ba = bitAlloc[iCh][sub_idx][iBand]
                         if ba: ba -= 1
                         pb.WriteBits(ba, codingParams.nMantSizeBits)
-                        pb.WriteBits(scaleFactor[iCh][i][iBand], codingParams.nScaleBits)
-                    pb.WriteBits(entropy_pbs[i].buffer, entropy_pbs[i].nBits)
+                        pb.WriteBits(scaleFactor[iCh][sub_idx][iBand], codingParams.nScaleBits)
+                    # Write per-sub-block overallScale + entropy mantissas
+                    for g in range(G):
+                        pb.WriteBits(overallScaleFactor[iCh][sub_idx + g], codingParams.nScaleBits)
+                        pb.WriteBits(entropy_pbs[ep_idx].buffer, entropy_pbs[ep_idx].nBits)
+                        ep_idx += 1
+                    sub_idx += G
             else:
                 pb.WriteBits(overallScaleFactor[iCh], codingParams.nScaleBits)
                 for iBand in range(codingParams.sfBands.nBands):

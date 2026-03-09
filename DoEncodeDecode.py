@@ -15,7 +15,7 @@ def EncodeDecode(inFilename="input.wav",
                  nMDCTLines=1024,
                  nScaleBits=3,
                  nMantSizeBits=5,
-                 targetBitsPerSample=2.9,
+                 targetBitsPerSample=2.4,
                  progressCallback=None, tempo = 120.0):
     """Encodes input WAV file inFilename into perceptually coded file
 codedFilename and then decodes that file into output WAV file outFilename.
@@ -35,7 +35,11 @@ of bits per sample.
     
 
     transient_map = detectTransients(inFilename)
-    transient_map = {x:0 for x in transient_map}
+    # Shift transient map back by 1 block for lookahead: the START block must
+    # precede the transient so that SHORT blocks capture the actual attack.
+    # Without this, the kick itself gets a LONG MDCT (START) and the post-kick
+    # bass content lands in SHORT blocks with terrible low-frequency resolution.
+    transient_map = {max(x - 1, 0): 0 for x in transient_map}
     
     print(f" found transients in {len(transient_map)} blocks")
 
@@ -104,5 +108,5 @@ of bits per sample.
 if __name__ == "__main__":
     EncodeDecode(inFilename='Van_124.wav', codedFilename='coded_128k_ms.pac',
                  outFilename='VANoutput_128k_ms.wav', targetBitsPerSample=128000/44100, tempo =124)
-    EncodeDecode(inFilename='Van_124.wav', codedFilename='coded_192k_ms.pac',
-                 outFilename='VANoutput_192k_ms.wav', targetBitsPerSample=192000/44100, tempo = 124)
+    # EncodeDecode(inFilename='Van_124.wav', codedFilename='coded_192k_ms.pac',
+    #              outFilename='VANoutput_192k_ms.wav', targetBitsPerSample=192000/44100, tempo = 124)
