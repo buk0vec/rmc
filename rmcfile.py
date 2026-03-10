@@ -165,14 +165,6 @@ class RMCFile(AudioFile):
         # add in scale factor band information
         myParams.sfBands = sfBands
 
-<<<<<<< Updated upstream
-        #RMC extras
-        myParams.numSamplesQuarterNote = int((60.0/tempo) * sampleRate)
-        myParams.numSamplesHalfBar = int(((60.0/tempo) * sampleRate)*2)
-        myParams.numSamplesBar = int(((60.0/tempo) * sampleRate)*4)
-        myParams.search_range = 255 #byte per block + 1 for sign bit
-        myParams.search_buffer = [np.zeros(myParams.numSamplesBar + myParams.search_range + myParams.nMDCTLines) for _ in range(myParams.nChannels)]
-=======
         # Calculate samples per quarter note
         samples_per_quarter_note = int((60.0 / tempo) * sampleRate)
          # Calculate samples per beat unit
@@ -205,7 +197,6 @@ class RMCFile(AudioFile):
         ]
         
         myParams.prev_use_ms = False  # tracks M/S mode of previous block for OLA transition
->>>>>>> Stashed changes
 
         # entropy coders
         myParams.entropyCoder_long = BlockEntropyCoder(14)
@@ -353,30 +344,6 @@ class RMCFile(AudioFile):
             codingParams.nScaleBits, codingParams.nMantSizeBits))
         
         # create a ScaleFactorBand object to be used by the encoding process and write its info to header
-<<<<<<< Updated upstream
-        sfBands=ScaleFactorBands( AssignMDCTLinesFromFreqLimits(codingParams.nMDCTLines,
-                                                                codingParams.sampleRate)
-                                )
-        codingParams.sfBands=sfBands
-        #short block switching additions
-        codingParams.nMDCTLines_short = codingParams.nMDCTLines // 8   
-        codingParams.blockType = LONG    
-        codingParams.entropyCoder_long = BlockEntropyCoder(14)
-        codingParams.entropyCoder_short = BlockEntropyCoder(14)
-
-        #RMC extras
-        codingParams.numSamplesQuarterNote = int((60.0/codingParams.tempo) * codingParams.sampleRate)
-        codingParams.numSamplesHalfBar = int(((60.0/codingParams.tempo) * codingParams.sampleRate)*2)
-        codingParams.numSamplesBar = int(((60.0/codingParams.tempo) * codingParams.sampleRate)*4)
-        codingParams.search_range = 255 #byte per block + 1 for sign bit
-        codingParams.search_buffer = [np.zeros(codingParams.numSamplesBar + codingParams.search_range + codingParams.nMDCTLines) for _ in range(codingParams.nChannels)]
-        # delayed prediction state: written to bitstream one block late to match 1-block MDCT delay
-        codingParams.prev_ranges  = [None] * codingParams.nChannels
-        codingParams.prev_offsets = [0]    * codingParams.nChannels
-
-        self.fp.write(pack('<L',sfBands.nBands))
-        self.fp.write(pack('<'+str(sfBands.nBands)+'H',*(sfBands.nLines.tolist()) ))
-=======
         sfBands = ScaleFactorBands(AssignMDCTLinesFromFreqLimits(codingParams.nMDCTLines,
                                                                   codingParams.sampleRate))
         codingParams.sfBands = sfBands
@@ -392,7 +359,6 @@ class RMCFile(AudioFile):
         self.fp.write(pack('<' + str(sfBands.nBands) + 'H', *(sfBands.nLines.tolist())))
         
         # Write tempo
->>>>>>> Stashed changes
         self.fp.write(pack('<L', codingParams.tempo))
         
         # Write time signature
@@ -440,14 +406,6 @@ class RMCFile(AudioFile):
         for iCh in range(codingParams.nChannels):
             priorBlock.append(np.zeros(codingParams.nMDCTLines, dtype=np.float64))
         codingParams.priorBlock = priorBlock
-<<<<<<< Updated upstream
-        # encoder-side OAA state (tracks residual overlap, separate from decoder OAA)
-        codingParams.enc_overlapAndAdd = [np.zeros(codingParams.nMDCTLines, dtype=np.float64) for _ in range(codingParams.nChannels)]
-        # prior residual block for building the 2N residual MDCT window
-        codingParams.priorResidualBlock = [np.zeros(codingParams.nMDCTLines, dtype=np.float64) for _ in range(codingParams.nChannels)]
-        #initialize prevBlockType
-        codingParams.prevBlockType = LONG
-=======
         
         # initialize prevBlockType
         codingParams.prevBlockType = LONG
@@ -469,7 +427,6 @@ class RMCFile(AudioFile):
         codingParams.mdct_pred_corrections = None
         codingParams.block_overhead = None
         
->>>>>>> Stashed changes
         return
 
 
