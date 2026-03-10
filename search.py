@@ -1,4 +1,6 @@
 import numpy as np
+from mdct import MDCT
+from blockswitching import WindowForBlockType, LONG
 
 PRED_MAP = {
     None: 0,
@@ -7,33 +9,10 @@ PRED_MAP = {
     "bar": 3
 }
 
-INV_PRED_MAP = {
-    0: None,
-    1: "quarter",
-    2: "half",
-    3: "bar"
-}
+# AAC LTP gain table: 8 values, transmitted as 3-bit index
+# https://github.com/FFmpeg/FFmpeg/blob/master/libavcodec/aactab.c lines 110-113
+GAIN_TABLE = np.array([0.570829, 0.696616, 0.813004, 0.911304, 0.984900, 1.067894, 1.194601, 1.369533])
 
-<<<<<<< Updated upstream
-def get_best_region(input_block, coding_params, buffer, threshold=0.8):
-    """
-    Find the best rhythmic prediction region for the input block.
-    
-    Parameters:
-    -----------
-    input_block : np.ndarray
-        2048 samples to encode
-    coding_params : object
-        Contains tempo, sample_rate, etc.
-    buffer : np.ndarray
-        Previous audio history (1 bar + padding)
-    padding : int
-        Search range padding in samples (default: 200)
-    threshold : float
-        MSE threshold ratio for rejecting prediction (default: 0.8)
-    
-    Returns:
-=======
 def pred_type_to_samples(pred_type, coding_params):
     """Map prediction range type string to sample offset."""
     return {'quarter': coding_params.numSamplesQuarterNote,
@@ -53,6 +32,7 @@ def quantize_gain(alpha_star):
     """Quantize gain to nearest entry in GAIN_TABLE. Returns (index, quantized_value)."""
     idx = int(np.argmin(np.abs(GAIN_TABLE - alpha_star)))
     return idx, GAIN_TABLE[idx]
+
 
 def get_search_offsets(time_signature):
     """
@@ -112,6 +92,7 @@ def get_search_offsets(time_signature):
     
     return offsets
 
+
 def get_best_region(mdct_X, input_pcm, coding_params, buffer, block_type=LONG):
     """
     Find the best rhythmic prediction region using normalised cross-correlation
@@ -119,26 +100,15 @@ def get_best_region(mdct_X, input_pcm, coding_params, buffer, block_type=LONG):
     Now meter-aware: adapts search ranges based on time signature.
 
     Returns
->>>>>>> Stashed changes
     --------
-    tuple: (range_type, data_to_encode, relative_offset)
-        range_type: str - "quarter", "half", "bar", or None
-        data_to_encode: np.ndarray - residual if prediction used, otherwise input_block
-        relative_offset: int - offset from center (0 if no prediction used)
+    (range_type, pcm_residual, relative_offset, mdct_P, alpha_idx, alpha_q)
+        range_type    : "quarter" / "half" / "bar" or None
+        pcm_residual  : time-domain residual (or input_pcm if no prediction)
+        relative_offset: int sample offset from center (0 if no prediction)
+        mdct_P        : prediction MDCT coefficients (or None if no prediction)
+        alpha_idx     : 3-bit gain table index (0 if no prediction)
+        alpha_q       : quantized gain scalar (1.0 if no prediction)
     """
-<<<<<<< Updated upstream
-    
-    # Calculate baseline energy
-    original_energy = np.var(input_block)
-    
-    block_size = len(input_block)
-    
-    # Initialize results storage
-    results = {}
-    
-    #search range 
-    padding = coding_params.search_range
-=======
     halfN = coding_params.nMDCTLines
     N = 2 * halfN
     N_short = 2 * coding_params.nMDCTLines_short
@@ -160,16 +130,9 @@ def get_best_region(mdct_X, input_pcm, coding_params, buffer, block_type=LONG):
     
     # Adjust for beat_unit (4 = quarter note, 8 = eighth note, etc.)
     beats_per_bar, beat_unit = time_signature
-    samples_per_beat_unit = int(samples_per_quarter_note * (4.0 / beat_unit))
+    
     if beat_unit == 8 and beats_per_bar % 3 == 0:
         # Compound meter: tempo refers to dotted quarter notes (3 eighths)
-        # So one "beat unit" (eighth note) = (1/3) of the tempo-marked beat
-        samples_per_beat_unit = int(samples_per_quarter_note * (4.0 / 8))  # eighth note duration
-        # But tempo is marked in compound beats (dotted quarters)
-        # So we need to treat the tempo as "compound beats per minute"
-        # 1 compound beat = 3 eighth notes = 1.5 quarter notes
-        # If tempo = 107 compound beats/min, then quarter note tempo = 107 * 1.5 = 160.5
-        # But we're given tempo as compound beats, so:
         samples_per_compound_beat = int((60.0 / tempo) * sample_rate)
         samples_per_beat_unit = samples_per_compound_beat // 3  # each eighth note
     else:
@@ -191,87 +154,55 @@ def get_best_region(mdct_X, input_pcm, coding_params, buffer, block_type=LONG):
         center_offset = len(buffer) - qn_multiplier
         search_start = center_offset - search_range
         search_end = center_offset + search_range
->>>>>>> Stashed changes
 
-    # Search each range type
-    range_configs = {
-        'quarter': coding_params.numSamplesQuarterNote ,
-        'half': coding_params.numSamplesHalfBar,
-        'bar': coding_params.numSamplesBar
-    }
+        if search_start < 0 or search_end + N > len(buffer):
+            continue
 
-
-    for range_type, qn_multiplier in range_configs.items():
-        
-        # Determine center offset
-        center_offset = qn_multiplier
-        
-        # Define search window using negative indices from end of buffer
-        # -center_offset is the nominal prediction point (e.g. exactly 1 quarter note ago)
-        search_start = -center_offset - padding
-        search_end = -center_offset + padding
-
-        # Ensure we don't go out of buffer bounds
-        if search_start < -len(buffer):
-            continue  # Skip this range if not enough history in buffer
-
-        # Sliding correlation search
-        best_correlation = -np.inf
-        best_sample_offset = None
+        # Search via normalised cross-correlation (no MDCTs in the loop)
+        best_score = -np.inf
+        best_sample_offset = center_offset
 
         for sample_offset in range(search_start, search_end + 1):
-            # Extract candidate region from buffer
-            candidate_region = buffer[sample_offset : sample_offset + block_size]
-
-            # Calculate normalized correlation
-            correlation = np.corrcoef(input_block, candidate_region)[0, 1]
-            # Track best match
-            if correlation > best_correlation:
-                best_correlation = correlation
+            candidate = buffer[sample_offset : sample_offset + N]
+            windowed_p = window * candidate
+            p_energy = np.dot(windowed_p, windowed_p)
+            if p_energy == 0:
+                continue
+            xcorr = np.dot(windowed_x, windowed_p)
+            score = (xcorr ** 2) / p_energy
+            if score > best_score:
+                best_score = score
                 best_sample_offset = sample_offset
 
-        if best_sample_offset is None:
-            best_sample_offset = -center_offset
+        # One MDCT for the winner
+        best_candidate = buffer[best_sample_offset : best_sample_offset + N]
+        mdct_P_best = MDCT(window * best_candidate, halfN, halfN)[:halfN]
+        relative_offset = best_sample_offset - center_offset
 
-        # Calculate residual and MSE
-        predicted_block = buffer[best_sample_offset : best_sample_offset + block_size]
-        residual = input_block - predicted_block
-        mse = np.mean(residual ** 2)
+        # Optimal block gain (least-squares scalar)
+        p_energy_mdct = np.dot(mdct_P_best, mdct_P_best)
+        if p_energy_mdct > 0:
+            alpha_star = np.dot(mdct_X, mdct_P_best) / p_energy_mdct
+            alpha_idx, alpha_q = quantize_gain(alpha_star)
+        else:
+            alpha_idx, alpha_q = 5, GAIN_TABLE[5]  # ~1.0 fallback
 
-        # Calculate relative offset from nominal center for block header encoding.
-        # Decoder reconstructs as buffer[-start_offset + relative_offset], so
-        # relative_offset = best_sample_offset + center_offset gives the same index.
-        relative_offset = best_sample_offset + center_offset
-        
-        # Store results
+        residual_mdct = mdct_X - alpha_q * mdct_P_best
+        mse = np.mean(residual_mdct ** 2)
+
         results[range_type] = {
-            'sample_offset': best_sample_offset,
             'relative_offset': relative_offset,
-            'residual': residual,
+            'pcm_residual': input_pcm - alpha_q * best_candidate,
+            'mdct_P': mdct_P_best,
             'mse': mse,
-            'correlation': best_correlation
+            'alpha_idx': alpha_idx,
+            'alpha_q': alpha_q,
         }
-    
-    # Check if we found any valid results
+
     if not results:
-        # No valid search performed, encode input directly
-        return (None, input_block, 0)
-    
-    # Find best range across all types
+        return (None, input_pcm, 0, None, 0, 1.0)
+
     best_range = min(results.keys(), key=lambda x: results[x]['mse'])
-<<<<<<< Updated upstream
-    best_mse = results[best_range]['mse']
-    best_residual = results[best_range]['residual']
-    best_relative_offset = results[best_range]['relative_offset']
-    
-    # Evaluate against threshold
-    if best_mse < threshold * original_energy:
-        # Prediction is helpful - encode residual
-        return (best_range, best_residual, best_relative_offset)
-    else:
-        # Prediction doesn't help - encode original input
-        return (None, input_block, 0)
-=======
     best = results[best_range]
 
     # Always return the best candidate; per-band enables in WriteDataBlock
@@ -282,4 +213,3 @@ def get_best_region(mdct_X, input_pcm, coding_params, buffer, block_type=LONG):
         best_range, best['pcm_residual'], best['relative_offset'],
         best['mdct_P'], best['alpha_idx'], best['alpha_q']
     )
->>>>>>> Stashed changes
