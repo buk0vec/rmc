@@ -4,7 +4,15 @@ import glob
 from pathlib import Path
 from DoEncodeDecode import EncodeDecode
 
-
+# Default to 120 for untimed pieces
+TEMPOS = {
+    'inputs/harpsichord.wav': 120,
+    'inputs/Brooklyn.wav': 97,
+    'inputs/castanets.wav': 120,
+    'inputs/spgm.wav': 120,
+    'inputs/Van_124.wav': 124,
+    'inputs/glockenspiel.wav': 120
+}
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -14,7 +22,7 @@ if __name__ == "__main__":
     codecs = {
         'pac': pac,
         'pacb': pacb,
-        'rmc': lambda inFilename, outFilename, rate_kb:  EncodeDecode(inFilename, outFilename, codedFilename=f"coded/{Path(outFilename).stem}.rmc", targetBitsPerSample=rate_kb * 1000 / 44100)
+        'rmc': lambda inFilename, outFilename, rate_kb:  EncodeDecode(inFilename, outFilename, codedFilename=f"coded/{Path(outFilename).stem}.rmc", targetBitsPerSample=rate_kb * 1000 / 44100, tempo=TEMPOS[inFilename])
     }
     encode = codecs[args.codec]
 
@@ -25,6 +33,6 @@ if __name__ == "__main__":
         suffix = f"_{args.codec}" if args.codec != "pac" else ""
         print(f"{args.codec.upper()} 128 kb/s/ch")
         encode(file, f"outputs/{reference_name}{suffix}_128kbps.wav", rate_kb=128)
-        print(f"{args.codec.upper()} 192 kb/s/ch")
-        encode(file, f"outputs/{reference_name}{suffix}_192kbps.wav", rate_kb=192)
+        print(f"{args.codec.upper()} 96 kb/s/ch")
+        encode(file, f"outputs/{reference_name}{suffix}_96kbps.wav", rate_kb=96)
         print("Done\n")
