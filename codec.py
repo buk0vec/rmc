@@ -9,36 +9,29 @@ codec.py -- The actual encode/decode functions for the perceptual audio codec
 import numpy as np  # used for arrays
 
 # used by Encode and Decode
-from window import SineWindow  # current window used for MDCT -- implement KB-derived?
 from mdct import MDCT,IMDCT  # fast MDCT implementation (uses numpy FFT)
 from quantize import *  # using vectorized versions (to use normal versions, uncomment lines 18,67 below defining vMantissa and vDequantize)
 
 # used only by Encode
 from psychoac import CalcSMRs  # calculates SMRs for each scale factor band
 from bitalloc import BitAlloc  #allocates bits to scale factor bands given SMRs
-from blockswitching import SelectBlockType, WindowForBlockType, ShortBlockSFBands, LONG, SHORT, N_SHORT_BLOCKS, SelectWindowGroups, mask_to_group_lens
+from blockswitching import WindowForBlockType, LONG, SHORT, N_SHORT_BLOCKS
 
 def Decode(scaleFactor,bitAlloc,mantissa,overallScaleFactor,codingParams,mdct_pred=None):
     """Reconstitutes a single-channel block of encoded data into a block of
     signed-fraction data based on the parameters in a PACFile object"""
 
-    
-
     halfN_long = codingParams.nMDCTLines
     N_long = 2*halfN_long
     halfN_short = codingParams.nMDCTLines_short 
     N_short = 2*halfN_short
-    sfBands_short = ShortBlockSFBands(codingParams.nMDCTLines_short, codingParams.sampleRate)
-    # vectorizing the Dequantize function call
-#    vDequantize = np.vectorize(Dequantize)
-
+    sfBands_short = codingParams.sfBands_short
     # reconstitute the first halfN MDCT lines of this channel from the stored data
     if codingParams.blockType == SHORT:
-        
+        # Decode 8 short sub-blocks, window each, and overlap-add into a long-block-sized
+        # output buffer. The 'pad' centers the short blocks within the long block window.
         N = N_short
         halfN = halfN_short
-        
-        
         pad = N_long//4 - N_short//4
         overlap_and_add = np.zeros(N_long)
         for i in range(N_SHORT_BLOCKS):
@@ -52,9 +45,7 @@ def Decode(scaleFactor,bitAlloc,mantissa,overallScaleFactor,codingParams,mdct_pr
                     mdctLine[iMant:(iMant+nLines)]=vDequantize(sf[iBand], mant[iMant:(iMant+nLines)],codingParams.nScaleBits, ba[iBand])
                 iMant += nLines
             mdctLine /= rescaleLevel  # put overall gain back to original level
-            if mdct_pred is not None:  # mdct_pred is a list of per-sub-block arrays for SHORT
-                mdctLine += mdct_pred[i]
-                # IMDCT and window the data for this channel
+            # IMDCT and window the data for this channel
             data = WindowForBlockType(codingParams.blockType, N_long, N_short) * IMDCT(mdctLine, halfN, halfN) # takes in halfN MDCT coeffs
             overlap_and_add[pad + i*halfN_short : pad + i*halfN_short + N_short] += data
 
@@ -99,34 +90,18 @@ def ExpandMantissa(mantissa_compact, bitAlloc, sfBands, halfN):
 
 
 def Encode(data,codingParams):
-    """Encodes a multi-channel block of signed-fraction data based on the parameters in a PACFile object"""
+    """Encodes a multi-channel block of signed-fraction data based on the parameters in a PACFile object.
+    Block type and grouping must be set on codingParams before calling."""
     scaleFactor = []
     bitAlloc = []
     mantissa = []
     overallScaleFactor = []
-    
-    block_idx = getattr(codingParams, 'blockIndex', 0)
-    transient_map = getattr(codingParams, 'transientBlocks', {})
-    k_attack = transient_map.get(block_idx, -1)
-    codingParams.blockType = SelectBlockType(k_attack, codingParams.prevBlockType)
-    codingParams.prevBlockType = codingParams.blockType
-    codingParams.blockIndex = block_idx + 1
-    # Compute window grouping for SHORT blocks
-    if codingParams.blockType == SHORT:
-        grouping_mask = SelectWindowGroups(k_attack)
-        codingParams.group_lens = mask_to_group_lens(grouping_mask)
-        codingParams.grouping_mask = grouping_mask
-    else:
-        codingParams.group_lens = None
-        codingParams.grouping_mask = 0
+
     # loop over channels and separately encode each one
-    masking_signals = getattr(codingParams, 'masking_signals', None)
-    mdct_corrections = getattr(codingParams, 'mdct_pred_corrections', None)
-    pred_bits_freed = getattr(codingParams, 'pred_bits_freed', None)
     for iCh in range(codingParams.nChannels):
-        codingParams._masking_signal = masking_signals[iCh] if masking_signals is not None else None
-        codingParams._mdct_pred_correction = mdct_corrections[iCh] if mdct_corrections is not None else None
-        codingParams._pred_bits_freed = pred_bits_freed[iCh] if pred_bits_freed is not None else 0.0
+        codingParams._masking_signal = codingParams.masking_signals[iCh] if codingParams.masking_signals is not None else None
+        codingParams._mdct_pred_correction = codingParams.mdct_pred_corrections[iCh] if codingParams.mdct_pred_corrections is not None else None
+        codingParams._block_overhead = codingParams.block_overhead[iCh] if codingParams.block_overhead is not None else 0
         (s,b,m,o) = EncodeSingleChannel(data[iCh],codingParams)
         scaleFactor.append(s)
         bitAlloc.append(b)
@@ -149,14 +124,12 @@ def EncodeSingleChannel(data,codingParams):
     maxMantBits = (1<<codingParams.nMantSizeBits)  # 1 isn't an allowed bit allocation so n size bits counts up to 2^n
     if maxMantBits>16: maxMantBits = 16  # to make sure we don't ever overflow mantissa holders
     sfBands_long = codingParams.sfBands
-    sfBands_short = ShortBlockSFBands(codingParams.nMDCTLines_short, codingParams.sampleRate)
-    # vectorizing the Mantissa function call
-    #    vMantissa = np.vectorize(Mantissa)
+    sfBands_short = codingParams.sfBands_short
     if codingParams.blockType == SHORT:
         N = N_short
         halfN = halfN_short
         pad = N_long//4 - N_short//4
-        group_lens = getattr(codingParams, 'group_lens', [1] * N_SHORT_BLOCKS)
+        group_lens = codingParams.group_lens
 
         # Phase 1: MDCT all 8 sub-blocks, compute per-sub-block overallScale and SMRs
         sub_mdct_scaled = []
@@ -173,8 +146,7 @@ def EncodeSingleChannel(data,codingParams):
             overallScale = ScaleFactor(maxLine, nScaleBits)
             mdctLines_scaled = mdctLines * (1 << overallScale)
 
-            masking_signal = getattr(codingParams, '_masking_signal', None)
-            masking_samples = masking_signal[pad + i*halfN : pad + i*halfN + N] if masking_signal is not None else timeSamples
+            masking_samples = codingParams._masking_signal[pad + i*halfN : pad + i*halfN + N] if codingParams._masking_signal is not None else timeSamples
             SMRs = CalcSMRs(masking_samples, mdctLines_scaled, overallScale, codingParams.sampleRate, sfBands_short)
 
             sub_ovs.append(overallScale)
@@ -197,7 +169,11 @@ def EncodeSingleChannel(data,codingParams):
             bitBudget -= nScaleBits * G                              # per-sub-block overallScale
             bitBudget -= nScaleBits * sfBands_short.nBands           # ONE set of band scale factors
             bitBudget -= codingParams.nMantSizeBits * sfBands_short.nBands  # ONE set of bit allocs
+            bitBudget -= codingParams._block_overhead * G / N_SHORT_BLOCKS  # proportional share of bitstream overhead
             bitBudget = max(int(bitBudget), 0)
+
+            # Inflate bit budget to exploit entropy coding compression
+            bitBudget = max(int(bitBudget * codingParams._entropy_inflation_short), 0)
 
             # Group SMR = max across sub-blocks per band
             combined_SMRs = np.max([sub_smrs[i] for i in subs], axis=0)
@@ -247,10 +223,11 @@ def EncodeSingleChannel(data,codingParams):
         bitBudget = codingParams.targetBitsPerSample * halfN  # this is overall target bit rate
         bitBudget -=  nScaleBits*(sfBands_long.nBands +1)  # less scale factor bits (including overall scale factor)
         bitBudget -= codingParams.nMantSizeBits*sfBands_long.nBands  # less mantissa bit allocation bits
-        # prediction savings: each dB of residual reduction frees 1/6 bit per line
-        bitBudget -= int(getattr(codingParams, '_pred_bits_freed', 0.0))
+        bitBudget -= codingParams._block_overhead  # bitstream overhead (block type, pred, M/S, nBytes field)
         bitBudget = max(bitBudget, 0)
 
+        # Inflate bit budget to exploit entropy coding compression
+        bitBudget = max(int(bitBudget * codingParams._entropy_inflation), 0)
 
         # window data for side chain FFT and also window and compute MDCT
         timeSamples = data
@@ -259,9 +236,8 @@ def EncodeSingleChannel(data,codingParams):
 
         # per-band prediction correction: cancel subtraction in non-enabled bands
         # mdctLines = (X - alpha_q*P) + alpha_q*P*(1-enable_mask) = X - alpha_q*P*enable_mask
-        correction = getattr(codingParams, '_mdct_pred_correction', None)
-        if correction is not None:
-            mdctLines = mdctLines + correction
+        if codingParams._mdct_pred_correction is not None:
+            mdctLines = mdctLines + codingParams._mdct_pred_correction
 
         # compute overall scale factor for this block and boost mdctLines using it
         maxLine = np.max( np.abs(mdctLines) )
@@ -270,8 +246,7 @@ def EncodeSingleChannel(data,codingParams):
 
         # compute the mantissa bit allocations
         # compute SMRs in side chain FFT (use original signal for masking if available)
-        masking_signal = getattr(codingParams, '_masking_signal', None)
-        masking_samples = masking_signal if masking_signal is not None else timeSamples
+        masking_samples = codingParams._masking_signal if codingParams._masking_signal is not None else timeSamples
         SMRs = CalcSMRs(masking_samples, mdctLines, overallScale, codingParams.sampleRate, sfBands_long)
         # perform bit allocation using SMR results
         bitAlloc = BitAlloc(bitBudget, maxMantBits, sfBands_long.nBands, sfBands_long.nLines, SMRs)
@@ -296,8 +271,3 @@ def EncodeSingleChannel(data,codingParams):
 
         # return results
         return (scaleFactor, bitAlloc, mantissa, overallScale)
-
-    
-
-
-

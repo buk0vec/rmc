@@ -1,104 +1,11 @@
 """
-pacfile.py -- Defines a PACFile class to handle reading and writing audio
-data to an audio file holding data compressed using an MDCT-based perceptual audio
-coding algorithm.  The MDCT lines of each audio channel are grouped into bands,
-each sharing a single scaleFactor and bit allocation that are used to block-
-floating point quantize those lines.  This class is a subclass of AudioFile.
+rmcfile.py -- RMC audio codec file format handler.
 
------------------------------------------------------------------------
-© 2009-2026 Marina Bosi & Richard E. Goldberg -- All rights reserved
------------------------------------------------------------------------
+Extends the baseline PAC codec with block switching, M/S stereo, rhythmic
+prediction, context-adaptive entropy coding, and adaptive bit budgeting.
+See RMC.md for full technical reference.
 
-See the documentation of the AudioFile class for general use of the AudioFile
-class.
-
-Notes on reading and decoding PAC files:
-
-    The OpenFileForReading() function returns a CodedParams object containing:
-
-        nChannels = the number of audio channels
-        sampleRate = the sample rate of the audio samples
-        numSamples = the total number of samples in the file for each channel
-        nMDCTLines = half the MDCT block size (block switching not supported)
-        nSamplesPerBlock = MDCTLines (but a name that PCM files look for)
-        nScaleBits = the number of bits storing scale factors
-        nMantSizeBits = the number of bits storing mantissa bit allocations
-        sfBands = a ScaleFactorBands object
-        overlapAndAdd = decoded data from the prior block (initially all zeros)
-
-    The returned ScaleFactorBands object, sfBands, contains an allocation of
-    the MDCT lines into groups that share a single scale factor and mantissa bit
-    allocation.  sfBands has the following attributes available:
-
-        nBands = the total number of scale factor bands
-        nLines[iBand] = the number of MDCT lines in scale factor band iBand
-        lowerLine[iBand] = the first MDCT line in scale factor band iBand
-        upperLine[iBand] = the last MDCT line in scale factor band iBand
-
-
-Notes on encoding and writing PAC files:
-
-    When writing to a PACFile the CodingParams object passed to OpenForWriting()
-    should have the following attributes set:
-
-        nChannels = the number of audio channels
-        sampleRate = the sample rate of the audio samples
-        numSamples = the total number of samples in the file for each channel
-        nMDCTLines = half the MDCT block size (format does not support block switching)
-        nSamplesPerBlock = MDCTLines (but a name that PCM files look for)
-        nScaleBits = the number of bits storing scale factors
-        nMantSizeBits = the number of bits storing mantissa bit allocations
-        targetBitsPerSample = the target encoding bit rate in units of bits per sample
-
-    The first three attributes (nChannels, sampleRate, and numSamples) are
-    typically added by the original data source (e.g. a PCMFile object) but
-    numSamples may need to be extended to account for the MDCT coding delay of
-    nMDCTLines and any zero-padding done in the final data block
-
-    OpenForWriting() will add the following attributes to be used during the encoding
-    process carried out in WriteDataBlock():
-
-        sfBands = a ScaleFactorBands object
-        priorBlock = the prior block of audio data (initially all zeros)
-
-    The passed ScaleFactorBands object, sfBands, contains an allocation of
-    the MDCT lines into groups that share a single scale factor and mantissa bit
-    allocation.  sfBands has the following attributes available:
-
-        nBands = the total number of scale factor bands
-        nLines[iBand] = the number of MDCT lines in scale factor band iBand
-        lowerLine[iBand] = the first MDCT line in scale factor band iBand
-        upperLine[iBand] = the last MDCT line in scale factor band iBand
-
-Description of the PAC File Format:
-
-    Header:
-
-        tag                 4 byte file tag equal to "PAC "
-        sampleRate          little-endian unsigned long ("<L" format in struct)
-        nChannels           little-endian unsigned short("<H" format in struct)
-        numSamples          little-endian unsigned long ("<L" format in struct)
-        nMDCTLines          little-endian unsigned long ("<L" format in struct)
-        nScaleBits          little-endian unsigned short("<H" format in struct)
-        nMantSizeBits       little-endian unsigned short("<H" format in struct)
-        nSFBands            little-endian unsigned long ("<L" format in struct)
-        for iBand in range(nSFBands):
-            nLines[iBand]   little-endian unsigned short("<H" format in struct)
-
-    Each Data Block:  (reads data blocks until end of file hit)
-
-        for iCh in range(nChannels):
-            nBytes          little-endian unsigned long ("<L" format in struct)
-            as bits packed into an array of nBytes bytes:
-                overallScale[iCh]                       nScaleBits bits
-                for iBand in range(nSFBands):
-                    scaleFactor[iCh][iBand]             nScaleBits bits
-                    bitAlloc[iCh][iBand]                nMantSizeBits bits
-                    if bitAlloc[iCh][iBand]:
-                        for m in nLines[iBand]:
-                            mantissa[iCh][iBand][m]     bitAlloc[iCh][iBand]+1 bits
-                <extra custom data bits as long as space is included in nBytes>
-
+Based on pacfile.py © 2009-2026 Marina Bosi & Richard E. Goldberg
 """
 
 from audiofile import * # base class
@@ -106,12 +13,13 @@ from bitpack import *  # class for packing data into an array of bytes where eac
 import codec    # module where the actual PAC coding functions reside(this module only specifies the PAC file format)
 from psychoac import ScaleFactorBands, AssignMDCTLinesFromFreqLimits  # defines the grouping of MDCT lines into scale factor bands
 from entropy import BlockEntropyCoder
-from blockswitching import LONG, SHORT, N_SHORT_BLOCKS, ShortBlockSFBands, WindowForBlockType, mask_to_group_lens
+from blockswitching import LONG, SHORT, N_SHORT_BLOCKS, ShortBlockSFBands, WindowForBlockType, SelectBlockType, mask_to_group_lens
 from mdct import MDCT, IMDCT
-from search import get_best_region, PRED_MAP, GAIN_TABLE
+from search import get_best_region, PRED_MAP, GAIN_TABLE, pred_type_to_samples, update_search_buffer
 
 import numpy as np  # to allow conversion of data blocks to numpy's array object
 MAX16BITS = 32767
+PRED_MAP_REV = {v: k for k, v in PRED_MAP.items()}  # int → string for decoder
 
 
 class RMCFile(AudioFile):
@@ -148,6 +56,7 @@ class RMCFile(AudioFile):
         myParams.nMantSizeBits = nMantSizeBits
         #short block switching additions
         myParams.nMDCTLines_short = nMDCTLines // 8
+        myParams.sfBands_short = ShortBlockSFBands(myParams.nMDCTLines_short, sampleRate)
         myParams.prevBlockType = LONG
         myParams.blockType = LONG
         # add in scale factor band information
@@ -184,7 +93,7 @@ class RMCFile(AudioFile):
         halfN = codingParams.nMDCTLines
         N = 2 * halfN
         N_short = 2 * codingParams.nMDCTLines_short
-        sfBands_short = ShortBlockSFBands(codingParams.nMDCTLines_short, codingParams.sampleRate)
+        sfBands_short = codingParams.sfBands_short
 
         # First pass: read all channels and decode (M/S or L/R depending on flag)
         raw_decoded = []
@@ -196,8 +105,7 @@ class RMCFile(AudioFile):
                     overlapAndAdd = codingParams.overlapAndAdd
                     codingParams.overlapAndAdd = 0
                     # Convert M/S overlapAndAdd to L/R before returning final tail
-                    prev_use_ms = getattr(codingParams, 'prev_use_ms', False)
-                    if prev_use_ms and codingParams.nChannels == 2:
+                    if codingParams.prev_use_ms and codingParams.nChannels == 2:
                         M_ola, S_ola = overlapAndAdd[0], overlapAndAdd[1]
                         overlapAndAdd = [M_ola + S_ola, M_ola - S_ola]
                     return overlapAndAdd
@@ -224,7 +132,7 @@ class RMCFile(AudioFile):
                 if pred_sign == 1:
                     pred_offset *= -1
                 pred_alpha_q = GAIN_TABLE[pb.ReadBits(3)]
-                if codingParams.blockType == LONG:  # enable flags only for LONG blocks
+                if codingParams.blockType != SHORT:  # enable flags for LONG/START/STOP blocks
                     pred_enable_flags = [bool(pb.ReadBits(1))
                                          for _ in range(codingParams.sfBands.nBands)]
 
@@ -268,14 +176,9 @@ class RMCFile(AudioFile):
 
             # Compute prediction signal from the search buffer.
             # Search buffer always holds L/R; for M/S blocks compute M or S on-the-fly.
-            mdct_P = None  # for LONG blocks: single array; for SHORT: list of 8 arrays
-            if pred_type != PRED_MAP[None]:
-                if pred_type == PRED_MAP['quarter']:
-                    start_offset = codingParams.numSamplesQuarterNote
-                elif pred_type == PRED_MAP['half']:
-                    start_offset = codingParams.numSamplesHalfBar
-                else:
-                    start_offset = codingParams.numSamplesBar
+            mdct_P = None
+            if pred_type != PRED_MAP[None] and codingParams.blockType != SHORT:
+                start_offset = pred_type_to_samples(PRED_MAP_REV[pred_type], codingParams)
                 if use_ms and codingParams.nChannels == 2:
                     buf_L = codingParams.search_buffer[0]
                     buf_R = codingParams.search_buffer[1]
@@ -285,36 +188,24 @@ class RMCFile(AudioFile):
                 seg_start = len(buf) - start_offset + pred_offset
                 if 0 <= seg_start and seg_start + N <= len(buf):
                     candidate = buf[seg_start : seg_start + N]
-                    if codingParams.blockType != SHORT:
-                        window = WindowForBlockType(codingParams.blockType, N, N_short)
-                        mdct_P_raw = MDCT(window * candidate, halfN, halfN)[:halfN]
-                        enable_mask = np.zeros(halfN)
-                        if pred_enable_flags is not None:
-                            for iBand, enabled in enumerate(pred_enable_flags):
-                                if enabled:
-                                    lo = codingParams.sfBands.lowerLine[iBand]
-                                    hi = codingParams.sfBands.upperLine[iBand] + 1
-                                    enable_mask[lo:hi] = 1.0
-                        mdct_P = pred_alpha_q * mdct_P_raw * enable_mask
-                    else:
-                        # SHORT block: per-sub-block prediction using same candidate
-                        halfN_short = codingParams.nMDCTLines_short
-                        pad = N // 4 - N_short // 4
-                        sub_preds = []
-                        for i in range(N_SHORT_BLOCKS):
-                            pcm_sub = candidate[pad + i*halfN_short : pad + i*halfN_short + N_short]
-                            w_s = WindowForBlockType(SHORT, N, N_short)
-                            mdct_P_i = MDCT(w_s * pcm_sub, halfN_short, halfN_short)[:halfN_short]
-                            sub_preds.append(pred_alpha_q * mdct_P_i)
-                        mdct_P = sub_preds  # list of 8 arrays for SHORT
+                    window = WindowForBlockType(codingParams.blockType, N, N_short)
+                    mdct_P_raw = MDCT(window * candidate, halfN, halfN)[:halfN]
+                    enable_mask = np.zeros(halfN)
+                    if pred_enable_flags is not None:
+                        for iBand, enabled in enumerate(pred_enable_flags):
+                            if enabled:
+                                lo = codingParams.sfBands.lowerLine[iBand]
+                                hi = codingParams.sfBands.upperLine[iBand] + 1
+                                enable_mask[lo:hi] = 1.0
+                    mdct_P = pred_alpha_q * mdct_P_raw * enable_mask
 
             decodedData = self.Decode(scaleFactor, bitAlloc, mantissa, overallScaleFactor,
                                       codingParams, mdct_pred=mdct_P)
             raw_decoded.append(decodedData)
 
-        # Handle M/S↔L/R mode transition: convert overlapAndAdd to match current block's domain
-        prev_use_ms = getattr(codingParams, 'prev_use_ms', False)
-        if codingParams.nChannels == 2 and use_ms != prev_use_ms:
+        # M/S↔L/R domain transition: if previous block used a different stereo mode,
+        # convert its overlap-and-add tail to the current block's domain before summing
+        if codingParams.nChannels == 2 and use_ms != codingParams.prev_use_ms:
             ola0, ola1 = codingParams.overlapAndAdd[0], codingParams.overlapAndAdd[1]
             if use_ms:
                 # Transition L/R → M/S
@@ -350,11 +241,7 @@ class RMCFile(AudioFile):
         else:
             lr_for_buffer = raw_decoded
         for iCh in range(codingParams.nChannels):
-            buf = codingParams.search_buffer[iCh]
-            buf[0:-halfN] = buf[halfN:]
-            buf[-halfN:] = 0
-            buf[-N:] += lr_for_buffer[iCh]
-            buf[-N:] = np.clip(buf[-N:], -1, 1)
+            update_search_buffer(codingParams.search_buffer[iCh], lr_for_buffer[iCh], halfN, N)
 
         return data
 
@@ -384,7 +271,8 @@ class RMCFile(AudioFile):
                                 )
         codingParams.sfBands=sfBands
         #short block switching additions
-        codingParams.nMDCTLines_short = codingParams.nMDCTLines // 8   
+        codingParams.nMDCTLines_short = codingParams.nMDCTLines // 8
+        codingParams.sfBands_short = ShortBlockSFBands(codingParams.nMDCTLines_short, codingParams.sampleRate)
         codingParams.blockType = LONG    
         codingParams.entropyCoder_long = BlockEntropyCoder(14)
         codingParams.entropyCoder_short = BlockEntropyCoder(14)
@@ -411,6 +299,15 @@ class RMCFile(AudioFile):
         codingParams._stat_pred_blocks = 0
         codingParams._stat_band_frac_sum = 0.0
         codingParams._stat_ms_blocks = 0
+        # Adaptive entropy inflation: tracks compression ratio and inflates bit budget
+        codingParams._entropy_ratio = 1.0
+        codingParams._entropy_inflation = 1.0
+        codingParams._entropy_ratio_short = 1.0
+        codingParams._entropy_inflation_short = 1.0
+        # Defaults for per-encode-pass state (set properly before second encode)
+        codingParams.masking_signals = None
+        codingParams.mdct_pred_corrections = None
+        codingParams.block_overhead = None
         return
 
 
@@ -419,13 +316,13 @@ class RMCFile(AudioFile):
         Writes a block of signed-fraction data to a PACFile object that has
         already executed OpenForWriting()"""
 
-        # Combine this block with the prior block to form full MDCT input (L/R domain)
+        # Concatenate previous and current half-blocks to form full MDCT input windows (L/R domain)
         fullBlockData_ = []
         for iCh in range(codingParams.nChannels):
             fullBlockData_.append(np.concatenate((codingParams.priorBlock[iCh], data[iCh])))
         codingParams.priorBlock = data
 
-        sfBands_short = ShortBlockSFBands(codingParams.nMDCTLines_short, codingParams.sampleRate)
+        sfBands_short = codingParams.sfBands_short
         halfN = codingParams.nMDCTLines
         N = 2 * halfN
         N_short = 2 * codingParams.nMDCTLines_short
@@ -440,10 +337,21 @@ class RMCFile(AudioFile):
                 use_ms = True
                 fullBlockData_ = [M, S]
 
-        # First encode pass: detect block type only (discard results)
-        saved_block_index = getattr(codingParams, 'blockIndex', 0)
-        saved_prev_block_type = codingParams.prevBlockType
-        self.Encode(fullBlockData_, codingParams)
+        # Block type state machine: LONG → START → SHORT → STOP → LONG
+        # Driven by pre-computed transient map (k_attack >= 0 triggers transition to SHORT)
+        k_attack = codingParams.transientBlocks.get(codingParams.blockIndex, -1)
+        codingParams.blockType = SelectBlockType(k_attack, codingParams.prevBlockType)
+        codingParams.prevBlockType = codingParams.blockType
+        codingParams.blockIndex += 1
+        if codingParams.blockType == SHORT:
+            # All 8 sub-blocks in one group: minimizes sf/ba overhead and lets the
+            # 2x bit budget go to mantissas. Without exact sub-window transient
+            # localization, isolating a specific window is a blind guess anyway.
+            codingParams.group_lens = [N_SHORT_BLOCKS]
+            codingParams.grouping_mask = 0
+        else:
+            codingParams.group_lens = None
+            codingParams.grouping_mask = 0
         current_block_type = codingParams.blockType
 
         # Compute M/S search buffers on-the-fly from L/R buffers (search buffers always hold L/R)
@@ -454,24 +362,28 @@ class RMCFile(AudioFile):
         else:
             search_bufs = [codingParams.search_buffer[iCh] for iCh in range(codingParams.nChannels)]
 
-        # Per-channel: search buffer for best prediction, compute residual
+        # Per-channel prediction search and residual computation.
+        # Produces three key outputs per channel:
+        #   enable_flags_list[iCh] — bool[nBands]: which bands use prediction (written to bitstream)
+        #   enable_masks[iCh]      — float[halfN]: same info expanded to MDCT lines (used in encode/decode)
+        #   corrections[iCh]       — float[halfN]: cancels prediction in disabled bands so encoder
+        #                             sees original signal there (None if no prediction)
         fullBlockData = []
         ranges = []
         offsets = []
-        pred_mdcts = []    # mdct_P per channel (or None)
-        alpha_idxs = []    # 3-bit gain index
-        alpha_qs = []      # quantized gain scalar
-        enable_flags_list = []  # bool array shape (nBands,) per channel — for bitstream
-        enable_masks = []       # float array shape (halfN,) per channel — for buffer/encoder
-        corrections = []        # per-channel encoder correction (or None)
-        pred_bits_freed = []    # bits to subtract from budget due to prediction
+        pred_mdcts = []
+        alpha_idxs = []
+        alpha_qs = []
+        enable_flags_list = []
+        enable_masks = []
+        corrections = []
         for iCh in range(codingParams.nChannels):
             if current_block_type != SHORT:
                 window = WindowForBlockType(current_block_type, N, N_short)
                 mdct_X = MDCT(window * fullBlockData_[iCh], halfN, halfN)[:halfN]
                 range_type, pcm_residual, rel_offset, mdct_P, alpha_idx, alpha_q = get_best_region(
                     mdct_X, fullBlockData_[iCh], codingParams,
-                    search_bufs[iCh]
+                    search_bufs[iCh], block_type=current_block_type
                 )
                 if range_type is not None:
                     # Per-band enable: apply prediction only where it reduces energy
@@ -492,40 +404,19 @@ class RMCFile(AudioFile):
                         enable_m = np.zeros(halfN)
                         correction = None
                     else:
+                        # Cancel prediction in disabled bands: encoder subtracts alpha*P from
+                        # the full signal, so we add back alpha*P where prediction is off
                         correction = alpha_q * mdct_P * (1.0 - enable_m)
                 else:
                     enable_f = np.zeros(codingParams.sfBands.nBands, dtype=bool)
                     enable_m = np.zeros(halfN)
                     correction = None
-            else:  # SHORT block only (START/STOP handled in the != SHORT branch above)
-                # SHORT block: same lag search on full N_long window, one lag for all 8 sub-blocks
-                window = WindowForBlockType(LONG, N, N_short)
-                mdct_X = MDCT(window * fullBlockData_[iCh], halfN, halfN)[:halfN]
-                range_type, pcm_residual, rel_offset, mdct_P, alpha_idx, alpha_q = get_best_region(
-                    mdct_X, fullBlockData_[iCh], codingParams, search_bufs[iCh]
-                )
-                if range_type is not None:
-                    # Accept only if overall time-domain energy is reduced (no per-band enables for SHORT)
-                    if np.dot(pcm_residual, pcm_residual) >= np.dot(fullBlockData_[iCh], fullBlockData_[iCh]):
-                        range_type, pcm_residual, rel_offset, mdct_P, alpha_idx, alpha_q = \
-                            None, fullBlockData_[iCh], 0, None, 0, 1.0
-                enable_f = np.array([], dtype=bool)  # SHORT: no per-band enables
+            else:  # SHORT block: skip prediction (transients are not repetitive)
+                range_type, pcm_residual, rel_offset, mdct_P, alpha_idx, alpha_q = \
+                    None, fullBlockData_[iCh], 0, None, 0, 1.0
+                enable_f = np.array([], dtype=bool)
                 enable_m = np.zeros(halfN)
                 correction = None
-            # 6 dB/bit: bits freed = 20·log10(peak_orig/peak_res)/6 · nLines per enabled band
-            # Only computed for LONG/START/STOP blocks (SHORT has no per-band enables)
-            bits_freed = 0.0
-            if range_type is not None and current_block_type != SHORT:
-                for iBand in range(codingParams.sfBands.nBands):
-                    if enable_f[iBand]:
-                        lo = codingParams.sfBands.lowerLine[iBand]
-                        hi = codingParams.sfBands.upperLine[iBand] + 1
-                        peak_orig = np.max(np.abs(mdct_X[lo:hi]))
-                        peak_res  = np.max(np.abs(residual_full[lo:hi]))
-                        if peak_orig > 1e-12 and peak_res > 1e-12:
-                            db_saved = max(0.0, 20.0 * np.log10(peak_orig / peak_res))
-                            bits_freed += (db_saved / 6.0) * codingParams.sfBands.nLines[iBand]
-            pred_bits_freed.append(bits_freed)
             fullBlockData.append(pcm_residual)
             ranges.append(range_type)
             offsets.append(rel_offset)
@@ -548,18 +439,30 @@ class RMCFile(AudioFile):
                      for iCh in pred_channels]
             codingParams._stat_band_frac_sum += np.mean(fracs)
 
-        # Restore block state; second encode on residuals with original signal for masking
-        codingParams.blockIndex = saved_block_index
-        codingParams.prevBlockType = saved_prev_block_type
+        # Compute per-channel bitstream overhead not accounted for in base bit budget
+        block_overhead = []
+        for iCh in range(codingParams.nChannels):
+            oh = 32 + 2 + 2  # nBytes field (4 bytes) + block type + pred type
+            if iCh == 0 and codingParams.nChannels == 2:
+                oh += 1  # M/S flag
+            if ranges[iCh] is not None:
+                oh += 1 + 8 + 3  # sign + offset + gain
+                if current_block_type != SHORT:
+                    oh += codingParams.sfBands.nBands  # per-band enable flags
+            if current_block_type == SHORT:
+                oh += 7  # grouping mask
+            block_overhead.append(oh)
+
+        # Encode the residual signals with original signal for psychoacoustic masking
         codingParams.masking_signals = fullBlockData_
         codingParams.mdct_pred_corrections = corrections
-        codingParams.pred_bits_freed = pred_bits_freed
+        codingParams.block_overhead = block_overhead
         (scaleFactor, bitAlloc, mantissa, overallScaleFactor) = self.Encode(fullBlockData, codingParams)
         codingParams.masking_signals = None
         codingParams.mdct_pred_corrections = None
-        codingParams.pred_bits_freed = None
 
-        # Buffer update: decode all channels (in M/S or L/R domain), convert to L/R, update buffers
+        # Encoder-side decode: reconstruct lossy output and store in search buffer so that
+        # future prediction searches see the same signal the decoder will have.
         halfN_short = codingParams.nMDCTLines_short
         decoded_channels = []
         for iCh in range(codingParams.nChannels):
@@ -573,28 +476,12 @@ class RMCFile(AudioFile):
                     scaleFactor[iCh], bitAlloc[iCh], mantissa_full,
                     overallScaleFactor[iCh], codingParams, mdct_pred=scaled_pred
                 )
-            else:  # SHORT block only (START/STOP use the LONG path above)
-                # SHORT block: expand compact mantissas per sub-block, decode with prediction
+            else:  # SHORT block (START/STOP use the LONG path above)
                 full_mant = [codec.ExpandMantissa(mantissa[iCh][i], bitAlloc[iCh][i], sfBands_short, halfN_short)
                              for i in range(N_SHORT_BLOCKS)]
-                sub_preds = None
-                if ranges[iCh] is not None:
-                    start_offset_map = {'quarter': codingParams.numSamplesQuarterNote,
-                                        'half':    codingParams.numSamplesHalfBar,
-                                        'bar':     codingParams.numSamplesBar}
-                    s_off = start_offset_map[ranges[iCh]]
-                    best = len(search_bufs[iCh]) - s_off + offsets[iCh]
-                    candidate = search_bufs[iCh][best : best + N]
-                    pad = N // 4 - N_short // 4
-                    sub_preds = []
-                    for i in range(N_SHORT_BLOCKS):
-                        pcm_sub = candidate[pad + i*halfN_short : pad + i*halfN_short + N_short]
-                        w_s = WindowForBlockType(SHORT, N, N_short)
-                        mdct_P_i = MDCT(w_s * pcm_sub, halfN_short, halfN_short)[:halfN_short]
-                        sub_preds.append(alpha_qs[iCh] * mdct_P_i)
                 decodedData = codec.Decode(
                     scaleFactor[iCh], bitAlloc[iCh], full_mant,
-                    overallScaleFactor[iCh], codingParams, mdct_pred=sub_preds
+                    overallScaleFactor[iCh], codingParams
                 )
             decoded_channels.append(decodedData)
 
@@ -605,13 +492,13 @@ class RMCFile(AudioFile):
         else:
             lr_for_buffer = decoded_channels
         for iCh in range(codingParams.nChannels):
-            buf = codingParams.search_buffer[iCh]
-            buf[0:-halfN] = buf[halfN:]
-            buf[-halfN:] = 0
-            buf[-N:] += lr_for_buffer[iCh]
-            buf[-N:] = np.clip(buf[-N:], -1, 1)
+            update_search_buffer(codingParams.search_buffer[iCh], lr_for_buffer[iCh], halfN, N)
 
-        # Write to file (channel 0 carries the 1-bit M/S flag for stereo)
+        # Write bitstream per channel:
+        #   [2b block_type | 2b pred_type | 1b ms_flag (ch0 only)]
+        #   [1b sign + 8b offset + 3b gain + nBands enable flags (if pred active)]
+        #   [7b grouping_mask (if SHORT)]
+        #   [nScaleBits ovs | nMantSizeBits+nScaleBits per band | entropy-coded mantissas]
         for iCh in range(codingParams.nChannels):
             entropy_pbs = []
             nBits = 4  # 2 bits block type + 2 bits prediction type
@@ -619,8 +506,8 @@ class RMCFile(AudioFile):
                 nBits += 1  # M/S flag
             if ranges[iCh] is not None:
                 nBits += 9 + 3  # sign+offset + gain
-                if codingParams.blockType == LONG:
-                    nBits += codingParams.sfBands.nBands  # per-band enables only for LONG
+                if codingParams.blockType != SHORT:
+                    nBits += codingParams.sfBands.nBands  # per-band enables for LONG/START/STOP
             if codingParams.blockType == SHORT:
                 group_lens = codingParams.group_lens
                 nBits += 7  # grouping mask
@@ -638,6 +525,18 @@ class RMCFile(AudioFile):
                         nBits += codingParams.nScaleBits  # overallScaleFactor
                         nBits += entropy_pb.nBits
                     sub_idx += G
+                # Update SHORT entropy compression ratio (EMA)
+                _raw_short = sum(
+                    bitAlloc[iCh][i][iBand] * sfBands_short.nLines[iBand]
+                    for i in range(N_SHORT_BLOCKS)
+                    for iBand in range(sfBands_short.nBands)
+                    if bitAlloc[iCh][i][iBand] > 0
+                )
+                _ent_short = sum(ep.nBits for ep in entropy_pbs)
+                if _raw_short > 0:
+                    _r = _ent_short / _raw_short
+                    codingParams._entropy_ratio_short = 0.9 * codingParams._entropy_ratio_short + 0.1 * _r
+                    codingParams._entropy_inflation_short = min(2.5, max(0.5, 1.0 / codingParams._entropy_ratio_short))
             else:
                 entropy_pb = codingParams.entropyCoder_long.encode_block(
                     mantissa[iCh], bitAlloc[iCh], codingParams.sfBands
@@ -646,6 +545,16 @@ class RMCFile(AudioFile):
                 for iBand in range(codingParams.sfBands.nBands):
                     nBits += codingParams.nMantSizeBits + codingParams.nScaleBits
                 nBits += entropy_pb.nBits
+                # Update LONG entropy compression ratio (EMA)
+                _raw_long = sum(
+                    bitAlloc[iCh][iBand] * codingParams.sfBands.nLines[iBand]
+                    for iBand in range(codingParams.sfBands.nBands)
+                    if bitAlloc[iCh][iBand] > 0
+                )
+                if _raw_long > 0:
+                    _r = entropy_pb.nBits / _raw_long
+                    codingParams._entropy_ratio = 0.9 * codingParams._entropy_ratio + 0.1 * _r
+                    codingParams._entropy_inflation = min(2.5, max(0.5, 1.0 / codingParams._entropy_ratio))
 
             nBytes = (nBits + BYTESIZE - 1) // BYTESIZE
             self.fp.write(pack("<L", int(nBytes)))
@@ -661,7 +570,7 @@ class RMCFile(AudioFile):
                 pb.WriteBits(sign, 1)
                 pb.WriteBits(abs(offsets[iCh]), 8)
                 pb.WriteBits(alpha_idxs[iCh], 3)
-                if codingParams.blockType == LONG:
+                if codingParams.blockType != SHORT:
                     for iBand in range(codingParams.sfBands.nBands):
                         pb.WriteBits(1 if enable_flags_list[iCh][iBand] else 0, 1)
 
@@ -713,6 +622,8 @@ class RMCFile(AudioFile):
             print(f"  Avg bands predicted    : {avg_band_frac:.1f}% of critical bands (when active)")
             if codingParams.nChannels == 2:
                 print(f"  Blocks with M/S stereo : {ms} / {total} ({100*ms/total:.1f}%)")
+            print(f"  Entropy inflation (LONG) : {codingParams._entropy_inflation:.2f}x (ratio={codingParams._entropy_ratio:.3f})")
+            print(f"  Entropy inflation (SHORT): {codingParams._entropy_inflation_short:.2f}x (ratio={codingParams._entropy_ratio_short:.3f})")
         self.fp.close()
 
 
@@ -738,13 +649,11 @@ class RMCFile(AudioFile):
 
 
 
-
-
 #-----------------------------------------------------------------------------
 
 if __name__ == "__main__":
     from prepare_materials import rmc
     import time
     elapsed = time.time()
-    rmc("inputs/castanets.wav", "outputs/castanets_rmc.wav", rate_kb=192)
+    rmc("inputs/Brooklyn.wav", "Brooklyn_96.wav", rate_kb=96)
     print(f"\nDone in {time.time() - elapsed:.1f}s")

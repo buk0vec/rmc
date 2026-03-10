@@ -12,3 +12,11 @@ wheels/
 coded/
 outputs/
 .DS_Store
+
+# Audio files
+*.wav
+*.pac
+*.pacb
+
+# Input audio
+inputs/

@@ -10,14 +10,30 @@ PRED_MAP = {
 }
 
 # AAC LTP gain table: 8 values, transmitted as 3-bit index
-GAIN_TABLE = np.array([0.5, 0.5674, 0.6424, 0.7267, 0.8224, 0.9305, 1.0526, 1.1608])
+# https://github.com/FFmpeg/FFmpeg/blob/master/libavcodec/aactab.c lines 110-113
+GAIN_TABLE = np.array([0.570829, 0.696616, 0.813004, 0.911304, 0.984900, 1.067894, 1.194601, 1.369533])
+
+def pred_type_to_samples(pred_type, coding_params):
+    """Map prediction range type string to sample offset."""
+    return {'quarter': coding_params.numSamplesQuarterNote,
+            'half':    coding_params.numSamplesHalfBar,
+            'bar':     coding_params.numSamplesBar}[pred_type]
+
+
+def update_search_buffer(buf, new_data, halfN, N):
+    """Shift search buffer by halfN, overlap-add new_data (length N), clip to [-1, 1]."""
+    buf[:-halfN] = buf[halfN:]
+    buf[-halfN:] = 0
+    buf[-N:] += new_data
+    buf[-N:] = np.clip(buf[-N:], -1, 1)
+
 
 def quantize_gain(alpha_star):
     """Quantize gain to nearest entry in GAIN_TABLE. Returns (index, quantized_value)."""
     idx = int(np.argmin(np.abs(GAIN_TABLE - alpha_star)))
     return idx, GAIN_TABLE[idx]
 
-def get_best_region(mdct_X, input_pcm, coding_params, buffer):
+def get_best_region(mdct_X, input_pcm, coding_params, buffer, block_type=LONG):
     """
     Find the best rhythmic prediction region using normalised cross-correlation
     in the time domain (one dot product per lag candidate, one MDCT per range type).
@@ -35,19 +51,17 @@ def get_best_region(mdct_X, input_pcm, coding_params, buffer):
     halfN = coding_params.nMDCTLines
     N = 2 * halfN
     N_short = 2 * coding_params.nMDCTLines_short
-    window = WindowForBlockType(LONG, N, N_short)
+    window = WindowForBlockType(block_type, N, N_short)
     windowed_x = window * input_pcm
 
     search_range = coding_params.search_range
 
-    range_configs = {
-        'quarter': coding_params.numSamplesQuarterNote,
-        'half':    coding_params.numSamplesHalfBar,
-        'bar':     coding_params.numSamplesBar,
-    }
-
+    # For each rhythmic lag (quarter/half/bar note), search ±search_range samples around
+    # the center offset using normalized cross-correlation (one dot product per candidate).
+    # Only the best candidate per range type gets an MDCT (avoids N_search MDCTs per type).
     results = {}
-    for range_type, qn_multiplier in range_configs.items():
+    for range_type in ('quarter', 'half', 'bar'):
+        qn_multiplier = pred_type_to_samples(range_type, coding_params)
         center_offset = len(buffer) - qn_multiplier
         search_start = center_offset - search_range
         search_end = center_offset + search_range
@@ -106,7 +120,6 @@ def get_best_region(mdct_X, input_pcm, coding_params, buffer):
     # guarantee prediction is only applied where it actually reduces energy,
     # so no global threshold is needed here.
 
-    return (None, input_pcm, 0, None, 0, 1.0)
     return (
         best_range, best['pcm_residual'], best['relative_offset'],
         best['mdct_P'], best['alpha_idx'], best['alpha_q']

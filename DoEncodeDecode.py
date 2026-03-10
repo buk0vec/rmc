@@ -2,7 +2,6 @@
 2026 copyrights Marina Bosi & Rich Goldberg
 """
 import time  # just for printing elapsed time
-# from TransientDetction import detect_transient_blocks
 import numpy as np
 from scipy.io import wavfile
 from rmcfile import *  # to get access to RMC file handling
@@ -16,7 +15,7 @@ def EncodeDecode(inFilename="input.wav",
                  nScaleBits=3,
                  nMantSizeBits=5,
                  targetBitsPerSample=2.4,
-                 progressCallback=None, tempo = 120.0):
+                 progressCallback=None, tempo: int = 120):
     """Encodes input WAV file inFilename into perceptually coded file
 codedFilename and then decodes that file into output WAV file outFilename.
 Allowed parameters are the number of indep MDCT lines per block (half the block
@@ -66,12 +65,25 @@ of bits per sample.
             codingParams.nMDCTLines = nMDCTLines
             codingParams.nScaleBits = nScaleBits
             codingParams.nMantSizeBits = nMantSizeBits
-            codingParams.targetBitsPerSample = targetBitsPerSample
             codingParams.nSamplesPerBlock = codingParams.nMDCTLines
             codingParams.tempo = tempo
             # transient map from pre-analysis
             codingParams.transientBlocks = transient_map
             codingParams.blockIndex = 0
+
+            # Adjust targetBitsPerSample so SHORT blocks' 2x budget
+            # doesn't push the file over the target bitrate.
+            # We know how many SHORT blocks there will be from pre-analysis.
+            total_blocks = int(np.ceil(codingParams.numSamples / nMDCTLines)) + 1  # +1 for flush block
+            n_short = len(transient_map)  # each transient → 1 SHORT block
+            n_long = total_blocks - n_short
+            # Budget equation: n_long * B + n_short * 2*B = total_blocks * B_target
+            # → B = B_target * total_blocks / (n_long + 2*n_short)
+            short_budget_factor = 2.0  # must match the multiplier in codec.py
+            adjusted_bps = targetBitsPerSample * total_blocks / (n_long + short_budget_factor * n_short)
+            print(f"  Adjusted bps: {targetBitsPerSample:.3f} -> {adjusted_bps:.3f} "
+                  f"({n_short} SHORT / {total_blocks} total blocks)")
+            codingParams.targetBitsPerSample = adjusted_bps
         else:  # "Decode"
             codingParams.bitsPerSample = 16
 
@@ -106,7 +118,7 @@ of bits per sample.
 
 
 if __name__ == "__main__":
-    EncodeDecode(inFilename='Van_124.wav', codedFilename='coded_128k_ms.pac',
-                 outFilename='VANoutput_128k_ms.wav', targetBitsPerSample=128000/44100, tempo =124)
+    EncodeDecode(inFilename='./brooklyn_full.wav', codedFilename='brooklyn_full_72.pac',
+                 outFilename='Brooklyn_72.wav', targetBitsPerSample=72000/44100, tempo = 97)
     # EncodeDecode(inFilename='Van_124.wav', codedFilename='coded_192k_ms.pac',
     #              outFilename='VANoutput_192k_ms.wav', targetBitsPerSample=192000/44100, tempo = 124)

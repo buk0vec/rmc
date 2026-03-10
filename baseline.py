@@ -2,6 +2,7 @@ from prepare_materials import pac, rmc, pacb
 import argparse
 import glob
 from pathlib import Path
+from DoEncodeDecode import EncodeDecode
 
 
 
@@ -13,7 +14,7 @@ if __name__ == "__main__":
     codecs = {
         'pac': pac,
         'pacb': pacb,
-        'rmc': rmc
+        'rmc': lambda inFilename, outFilename, rate_kb:  EncodeDecode(inFilename, outFilename, codedFilename=f"coded/{Path(outFilename).stem}.rmc", targetBitsPerSample=rate_kb * 1000 / 44100)
     }
     encode = codecs[args.codec]
 
