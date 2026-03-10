@@ -127,45 +127,96 @@ class RMCFile(AudioFile):
         object attributes.  File pointer ends at start of data portion.
         """
         # check file header tag to make sure it is the right kind of file
-        tag=self.fp.read(4)
-        if tag!=self.tag: raise RuntimeError("Tried to read a non-PAC file into a PACFile object")
+        tag = self.fp.read(4)
+        if tag != self.tag:
+            raise RuntimeError("Tried to read a non-RMC file into a RMCFile object")
+        
         # use struct.unpack() to load up all the header data
         (sampleRate, nChannels, numSamples, nMDCTLines, nScaleBits, nMantSizeBits) \
-                 = unpack('<LHLLHH',self.fp.read(calcsize('<LHLLHH')))
-        nBands = unpack('<L',self.fp.read(calcsize('<L')))[0]
-        nLines=  unpack('<'+str(nBands)+'H',self.fp.read(calcsize('<'+str(nBands)+'H')))
-        tempo = unpack('<L',self.fp.read(calcsize('<L')))[0]
-        sfBands=ScaleFactorBands(nLines)
+                 = unpack('<LHLLHH', self.fp.read(calcsize('<LHLLHH')))
+        
+        nBands = unpack('<L', self.fp.read(calcsize('<L')))[0]
+        nLines = unpack('<' + str(nBands) + 'H', self.fp.read(calcsize('<' + str(nBands) + 'H')))
+        
+        # Read tempo
+        tempo = unpack('<L', self.fp.read(calcsize('<L')))[0]
+        
+        # Read time signature
+        beats_per_bar, beat_unit = unpack('<HH', self.fp.read(calcsize('<HH')))
+        
+        sfBands = ScaleFactorBands(nLines)
+        
         # load up a CodingParams object with the header data
-        myParams=CodingParams()
+        myParams = CodingParams()
         myParams.tempo = tempo
+        myParams.time_signature = (beats_per_bar, beat_unit)
         myParams.sampleRate = sampleRate
         myParams.nChannels = nChannels
         myParams.numSamples = numSamples
         myParams.nMDCTLines = myParams.nSamplesPerBlock = nMDCTLines
         myParams.nScaleBits = nScaleBits
         myParams.nMantSizeBits = nMantSizeBits
-        #short block switching additions
+        
+        # short block switching additions
         myParams.nMDCTLines_short = nMDCTLines // 8
         myParams.prevBlockType = LONG
         myParams.blockType = LONG
+        
         # add in scale factor band information
-        myParams.sfBands =sfBands
+        myParams.sfBands = sfBands
 
+<<<<<<< Updated upstream
         #RMC extras
         myParams.numSamplesQuarterNote = int((60.0/tempo) * sampleRate)
         myParams.numSamplesHalfBar = int(((60.0/tempo) * sampleRate)*2)
         myParams.numSamplesBar = int(((60.0/tempo) * sampleRate)*4)
         myParams.search_range = 255 #byte per block + 1 for sign bit
         myParams.search_buffer = [np.zeros(myParams.numSamplesBar + myParams.search_range + myParams.nMDCTLines) for _ in range(myParams.nChannels)]
+=======
+        # Calculate samples per quarter note
+        samples_per_quarter_note = int((60.0 / tempo) * sampleRate)
+         # Calculate samples per beat unit
+    # COMPOUND METER HANDLING
+        if beat_unit == 8 and beats_per_bar % 3 == 0:
+        # Compound meter: tempo is in compound beats (dotted quarters)
+            samples_per_compound_beat = int((60.0 / tempo) * sampleRate)
+            samples_per_beat_unit = samples_per_compound_beat // 3  # each eighth note
+        else:
+        # Simple meter
+            samples_per_beat_unit = int(samples_per_quarter_note * (4.0 / beat_unit))
+       
+        
+        # RMC extras - now meter-aware
+        myParams.numSamplesQuarterNote = samples_per_quarter_note
+        myParams.numSamplesBar = samples_per_beat_unit * beats_per_bar
+        
+        # For half-bar
+        if beats_per_bar % 2 == 0:
+            myParams.numSamplesHalfBar = samples_per_beat_unit * (beats_per_bar // 2)
+        else:
+            myParams.numSamplesHalfBar = samples_per_beat_unit * (beats_per_bar // 2)
+        
+        myParams.search_range = 255
+        
+        # Buffer size: 2 bars + search range for safety
+        myParams.search_buffer = [
+            np.zeros(myParams.numSamplesBar * 2 + myParams.search_range)
+            for _ in range(nChannels)
+        ]
+        
+        myParams.prev_use_ms = False  # tracks M/S mode of previous block for OLA transition
+>>>>>>> Stashed changes
 
         # entropy coders
         myParams.entropyCoder_long = BlockEntropyCoder(14)
         myParams.entropyCoder_short = BlockEntropyCoder(14)
+        
         # start w/o all zeroes as data from prior block to overlap-and-add for output
         overlapAndAdd = []
-        for iCh in range(nChannels): overlapAndAdd.append(np.zeros(nMDCTLines, dtype=np.float64) )
-        myParams.overlapAndAdd=overlapAndAdd
+        for iCh in range(nChannels):
+            overlapAndAdd.append(np.zeros(nMDCTLines, dtype=np.float64))
+        myParams.overlapAndAdd = overlapAndAdd
+        
         return myParams
 
 
@@ -278,26 +329,31 @@ class RMCFile(AudioFile):
         return data
 
 
-    def WriteFileHeader(self,codingParams):
+    def WriteFileHeader(self, codingParams):
         """
         Writes the PAC file header for a just-opened PAC file and uses codingParams
         attributes for the header data.  File pointer ends at start of data portion.
         """
         # write a header tag
         self.fp.write(self.tag)
+        
         # make sure that the number of samples in the file is a multiple of the
         # number of MDCT half-blocksize, otherwise zero pad as needed
-        if not codingParams.numSamples%codingParams.nMDCTLines:
+        if not codingParams.numSamples % codingParams.nMDCTLines:
             codingParams.numSamples += (codingParams.nMDCTLines
-                        - codingParams.numSamples%codingParams.nMDCTLines) # zero padding for partial final PCM block
+                        - codingParams.numSamples % codingParams.nMDCTLines)
+        
         # also add in the delay block for the second pass w/ the last half-block
-        codingParams.numSamples+= codingParams.nMDCTLines  # due to the delay in processing the first samples on both sides of the MDCT block
+        codingParams.numSamples += codingParams.nMDCTLines
+        
         # write the coded file attributes
         self.fp.write(pack('<LHLLHH',
             codingParams.sampleRate, codingParams.nChannels,
             codingParams.numSamples, codingParams.nMDCTLines,
-            codingParams.nScaleBits, codingParams.nMantSizeBits  ))
+            codingParams.nScaleBits, codingParams.nMantSizeBits))
+        
         # create a ScaleFactorBand object to be used by the encoding process and write its info to header
+<<<<<<< Updated upstream
         sfBands=ScaleFactorBands( AssignMDCTLinesFromFreqLimits(codingParams.nMDCTLines,
                                                                 codingParams.sampleRate)
                                 )
@@ -320,18 +376,100 @@ class RMCFile(AudioFile):
 
         self.fp.write(pack('<L',sfBands.nBands))
         self.fp.write(pack('<'+str(sfBands.nBands)+'H',*(sfBands.nLines.tolist()) ))
+=======
+        sfBands = ScaleFactorBands(AssignMDCTLinesFromFreqLimits(codingParams.nMDCTLines,
+                                                                  codingParams.sampleRate))
+        codingParams.sfBands = sfBands
+        
+        # short block switching additions
+        codingParams.nMDCTLines_short = codingParams.nMDCTLines // 8
+        codingParams.sfBands_short = ShortBlockSFBands(codingParams.nMDCTLines_short, codingParams.sampleRate)
+        codingParams.blockType = LONG
+        codingParams.entropyCoder_long = BlockEntropyCoder(14)
+        codingParams.entropyCoder_short = BlockEntropyCoder(14)
+
+        self.fp.write(pack('<L', sfBands.nBands))
+        self.fp.write(pack('<' + str(sfBands.nBands) + 'H', *(sfBands.nLines.tolist())))
+        
+        # Write tempo
+>>>>>>> Stashed changes
         self.fp.write(pack('<L', codingParams.tempo))
+        
+        # Write time signature
+        time_sig = getattr(codingParams, 'time_signature', (4, 4))
+        self.fp.write(pack('<HH', time_sig[0], time_sig[1]))  # beats_per_bar, beat_unit
+        
+        # Get time signature components
+        beats_per_bar, beat_unit = time_sig
+        
+        # Calculate samples per quarter note
+        samples_per_quarter_note = int((60.0 / codingParams.tempo) * codingParams.sampleRate)
+        if beat_unit == 8 and beats_per_bar % 3 == 0:
+        # Compound meter: tempo is in compound beats (dotted quarters)
+            samples_per_compound_beat = int((60.0 / codingParams.tempo) * codingParams.sampleRate)
+            samples_per_beat_unit = samples_per_compound_beat // 3  # each eighth note
+        else:
+        # Simple meter
+            samples_per_beat_unit = int(samples_per_quarter_note * (4.0 / beat_unit))    
+      
+        
+        # RMC extras - now meter-aware
+        codingParams.numSamplesQuarterNote = samples_per_quarter_note
+        codingParams.numSamplesBar = samples_per_beat_unit * beats_per_bar
+        
+        # For half-bar, check if it makes sense for this meter
+        if beats_per_bar % 2 == 0:
+            codingParams.numSamplesHalfBar = samples_per_beat_unit * (beats_per_bar // 2)
+        else:
+            # For 3/4, 5/4, 7/4, etc., use floor division
+            codingParams.numSamplesHalfBar = samples_per_beat_unit * (beats_per_bar // 2)
+        
+        codingParams.search_range = 255
+        
+        # Buffer size: need enough history for the longest prediction + search range
+        # Make buffer size = 2 bars + search range for safety
+        codingParams.search_buffer = [
+            np.zeros(codingParams.numSamplesBar * 2 + codingParams.search_range)
+            for _ in range(codingParams.nChannels)
+        ]
+        
+        codingParams.prev_use_ms = False  # tracks M/S mode of previous block for OLA transition
+
         # start w/o all zeroes as prior block of unencoded data for other half of MDCT block
         priorBlock = []
         for iCh in range(codingParams.nChannels):
-            priorBlock.append(np.zeros(codingParams.nMDCTLines,dtype=np.float64) )
+            priorBlock.append(np.zeros(codingParams.nMDCTLines, dtype=np.float64))
         codingParams.priorBlock = priorBlock
+<<<<<<< Updated upstream
         # encoder-side OAA state (tracks residual overlap, separate from decoder OAA)
         codingParams.enc_overlapAndAdd = [np.zeros(codingParams.nMDCTLines, dtype=np.float64) for _ in range(codingParams.nChannels)]
         # prior residual block for building the 2N residual MDCT window
         codingParams.priorResidualBlock = [np.zeros(codingParams.nMDCTLines, dtype=np.float64) for _ in range(codingParams.nChannels)]
         #initialize prevBlockType
         codingParams.prevBlockType = LONG
+=======
+        
+        # initialize prevBlockType
+        codingParams.prevBlockType = LONG
+        
+        # prediction stats
+        codingParams._stat_total_blocks = 0
+        codingParams._stat_pred_blocks = 0
+        codingParams._stat_band_frac_sum = 0.0
+        codingParams._stat_ms_blocks = 0
+        
+        # Adaptive entropy inflation: tracks compression ratio and inflates bit budget
+        codingParams._entropy_ratio = 1.0
+        codingParams._entropy_inflation = 1.0
+        codingParams._entropy_ratio_short = 1.0
+        codingParams._entropy_inflation_short = 1.0
+        
+        # Defaults for per-encode-pass state (set properly before second encode)
+        codingParams.masking_signals = None
+        codingParams.mdct_pred_corrections = None
+        codingParams.block_overhead = None
+        
+>>>>>>> Stashed changes
         return
 
 
