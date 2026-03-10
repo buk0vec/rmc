@@ -386,15 +386,14 @@ class RMCFile(AudioFile):
                     search_bufs[iCh], block_type=current_block_type
                 )
                 if range_type is not None:
-                    # Per-band enable: apply prediction only where it reduces energy
+                    # Per-band enable: apply prediction only where it reduces peak magnitude
                     residual_full = mdct_X - alpha_q * mdct_P
                     enable_f = np.zeros(codingParams.sfBands.nBands, dtype=bool)
                     enable_m = np.zeros(halfN)
                     for iBand in range(codingParams.sfBands.nBands):
                         lo = codingParams.sfBands.lowerLine[iBand]
                         hi = codingParams.sfBands.upperLine[iBand] + 1
-                        if np.dot(residual_full[lo:hi], residual_full[lo:hi]) < \
-                                np.dot(mdct_X[lo:hi], mdct_X[lo:hi]):
+                        if np.amax(np.abs(residual_full[lo:hi])) < np.amax(np.abs(mdct_X[lo:hi])):
                             enable_f[iBand] = True
                             enable_m[lo:hi] = 1.0
                     if not np.any(enable_f):

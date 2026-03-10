@@ -15,7 +15,8 @@ def EncodeDecode(inFilename="input.wav",
                  nScaleBits=3,
                  nMantSizeBits=5,
                  targetBitsPerSample=2.4,
-                 progressCallback=None, tempo: int = 120):
+                 progressCallback=None, 
+                 tempo: int = 120):
     """Encodes input WAV file inFilename into perceptually coded file
 codedFilename and then decodes that file into output WAV file outFilename.
 Allowed parameters are the number of indep MDCT lines per block (half the block
@@ -104,7 +105,7 @@ of bits per sample.
                 overall_progress = (iDir * 50) + pass_progress
                 progressCallback(overall_progress)
 
-            print(".", end="")  # just to signal how far we've gotten to user
+            print(".", end="", flush=True)  # just to signal how far we've gotten to user
         # end loop over reading/writing the blocks
 
         # close the files
@@ -118,7 +119,7 @@ of bits per sample.
 
 
 if __name__ == "__main__":
-    EncodeDecode(inFilename='./brooklyn_full.wav', codedFilename='brooklyn_full_72.pac',
-                 outFilename='Brooklyn_72.wav', targetBitsPerSample=72000/44100, tempo = 97)
+    EncodeDecode(inFilename='inputs/Brooklyn.wav', codedFilename='brooklyn_72.pac',
+                 outFilename='Brooklyn_clip_72.wav', targetBitsPerSample=72000/44100, tempo = 97)
     # EncodeDecode(inFilename='Van_124.wav', codedFilename='coded_192k_ms.pac',
     #              outFilename='VANoutput_192k_ms.wav', targetBitsPerSample=192000/44100, tempo = 124)

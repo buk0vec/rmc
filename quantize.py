@@ -256,7 +256,7 @@ def vMantissa(aNumVec, scale, nScaleBits=3, nMantBits=5):
         mask = (1 << (quant_bits - (scale + 1))) - 1
         mantissa = num_q & mask
         # Filter out nMantBits-1 bits after the scale + 1st
-        mask = ~((np.uint64(1) << (quant_bits - (scale + nMantBits)))-1)
+        mask = ~((1 << (quant_bits - (scale + nMantBits)))-1)
         mantissa &= mask
         # Reshift mantissa bits back
         mantissa >>= quant_bits - (scale + nMantBits)
