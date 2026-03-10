@@ -360,12 +360,12 @@ if __name__=="__main__":
         # create the audio file objects
         if Direction == "Encode":
             print( "\n\tEncoding input PCM file...",)
-            inFile= PCMFile("input.wav")
+            inFile= PCMFile("inputs/Brooklyn.wav")
             outFile = PACFile("coded.pac")
         else: # "Decode"
             print( "\n\tDecoding coded PAC file...",)
             inFile = PACFile("coded.pac")
-            outFile= PCMFile("output.wav")
+            outFile= PCMFile("Brookyn_60_pac.wav")
         # only difference is file names and type of AudioFile object
 
         # open input file
@@ -376,9 +376,9 @@ if __name__=="__main__":
             # set additional parameters that are needed for PAC file
             # (beyond those set by the PCM file on open)
             codingParams.nMDCTLines = 1024
-            codingParams.nScaleBits = 2
-            codingParams.nMantSizeBits = 3
-            codingParams.targetBitsPerSample = 2.5  # target bit rate in bits per sample
+            codingParams.nScaleBits = 3
+            codingParams.nMantSizeBits = 5
+            codingParams.targetBitsPerSample = 60000 / 44100   # target bit rate in bits per sample
             # tell the PCM file how large the block size is
             codingParams.nSamplesPerBlock = codingParams.nMDCTLines
         else: # "Decode"

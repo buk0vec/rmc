@@ -33,7 +33,8 @@ N_SHORT_BLOCKS = 8
 # Transient detection
 # ---------------------------------------------------------------------------
 
-def DetectTransient(data, prev_data, threshold=10.0):
+
+def DetectTransient(data, prev_data, threshold=25.0):
     """
     Detects whether a transient (sudden amplitude increase) occurs in `data`.
 
@@ -105,7 +106,7 @@ def SelectBlockType(k_attack, prev_block_type):
         elif prev_block_type == SHORT:
             return SHORT
         elif prev_block_type == STOP:
-            return LONG
+            return START  # new transient during STOP: go back to START rather than inserting an unprotected LONG
     else:
         if prev_block_type == SHORT:
             return STOP
