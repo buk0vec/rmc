@@ -14,16 +14,10 @@ def EncodeDecode(inFilename="input.wav",
                  codedFilename="coded.pac",
                  nMDCTLines=1024,
                  nScaleBits=3,
-<<<<<<< Updated upstream
-                 nMantSizeBits=4,
-                 targetBitsPerSample=2.9,
-                 progressCallback=None, tempo = 120.0):
-=======
                  nMantSizeBits=5,
                  targetBitsPerSample=2.4,
                  progressCallback=None, tempo: int = 120,
                  time_signature: tuple = (4, 4)):
->>>>>>> Stashed changes
     """Encodes input WAV file inFilename into perceptually coded file
 codedFilename and then decodes that file into output WAV file outFilename.
 Allowed parameters are the number of indep MDCT lines per block (half the block
@@ -120,16 +114,9 @@ of bits per sample.
 
 
 if __name__ == "__main__":
-<<<<<<< Updated upstream
-    EncodeDecode(inFilename='Van_124.wav', codedFilename='coded_128k.pac',
-                 outFilename='VANoutput_128k.wav', targetBitsPerSample=128000/44100, tempo =124)
-    EncodeDecode(inFilename='Van_124.wav', codedFilename='coded_192k.pac',
-                 outFilename='VANoutput_192k.wav', targetBitsPerSample=192000/44100, tempo = 124)
-=======
     #EncodeDecode(inFilename='./brooklyn_full.wav', codedFilename='brooklyn_full_72.pac',
     #             outFilename='Brooklyn_72.wav', targetBitsPerSample=192000/44100, tempo = 97,time_signature=(4, 4))
     EncodeDecode(inFilename='BipolarNightmare.wav', codedFilename='coded_128k_68ms.pac',
                   outFilename='BipolarNightmare_128k_68ms.wav', targetBitsPerSample=128000/44100, tempo = 80,time_signature=(6, 8))
     #EncodeDecode(inFilename='BipolarNightmare.wav', codedFilename='coded_128k_44ms.pac',
                  # outFilename='BipolarNightmare_128k_44ms.wav', targetBitsPerSample=128000/44100, tempo = 80,time_signature=(4, 4))
->>>>>>> Stashed changes
