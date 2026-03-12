@@ -197,7 +197,8 @@ def detectTransients(audioPath, sr=22050, duration=None,
                      use_auto_params=True,
                      blockSize=1024,
                      cwt_onset_threshold=0.3,
-                     time_threshold_factor=0.25):
+                     time_threshold_factor=0.25,
+                     verbose=True):
     """
     Detect transients and return combined block array.
     """
@@ -226,8 +227,8 @@ def detectTransients(audioPath, sr=22050, duration=None,
         time_threshold_factor = params["time_threshold_factor"]
         cwt_min_distance_ms = params["cwt_min_distance_ms"]
         cwt_freq_weight = params["cwt_freq_weight"]
-        print(f"  audio_type: {analysis['audio_type']}")
-        print(f"  characteristics: {analysis['characteristics']}")
+        # print(f"  audio_type: {analysis['audio_type']}")
+        # print(f"  characteristics: {analysis['characteristics']}")
     else:
         cwt_min_distance_ms = 50
         cwt_freq_weight = 1.5
@@ -274,8 +275,8 @@ def detectTransients(audioPath, sr=22050, duration=None,
 
     # # COMBINE
     # combined_blocks = combineTimeAndFreqOnsets(transientBlocks_time, transientBlocks_cwt)
-
-    print(f"  Time-domain blocks ({len(transientBlocks_time)}): {transientBlocks_time}")
+    if verbose:
+        print(f"  Time-domain blocks ({len(transientBlocks_time)}): {transientBlocks_time}")
     # print(f"  CWT blocks         ({len(transientBlocks_cwt)}): {transientBlocks_cwt}")
 
     return np.array(transientBlocks_time)
