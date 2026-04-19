@@ -7,6 +7,7 @@ codec.py -- The actual encode/decode functions for the perceptual audio codec
 """
 
 import numpy as np  # used for arrays
+from features import SHORT_BLOCK_BITBOOST
 
 # used by Encode and Decode
 from mdct import MDCT,IMDCT  # fast MDCT implementation (uses numpy FFT)
@@ -165,7 +166,8 @@ def EncodeSingleChannel(data,codingParams):
             # Pooled bit budget: G sub-blocks share sf/ba overhead once
             # SHORT blocks need extra bits: wider noise bandwidth per MDCT line
             # (~172 Hz vs ~21 Hz for LONG) makes quantization noise harder to mask
-            bitBudget = codingParams.targetBitsPerSample * halfN * G * 2.0
+            _short_boost = 2.0 if SHORT_BLOCK_BITBOOST else 1.0
+            bitBudget = codingParams.targetBitsPerSample * halfN * G * _short_boost
             bitBudget -= nScaleBits * G                              # per-sub-block overallScale
             bitBudget -= nScaleBits * sfBands_short.nBands           # ONE set of band scale factors
             bitBudget -= codingParams.nMantSizeBits * sfBands_short.nBands  # ONE set of bit allocs
