@@ -12,7 +12,8 @@ from audiofile import * # base class
 from bitpack import *  # class for packing data into an array of bytes where each item's number of bits is specified
 import codec    # module where the actual PAC coding functions reside(this module only specifies the PAC file format)
 from psychoac import ScaleFactorBands, AssignMDCTLinesFromFreqLimits  # defines the grouping of MDCT lines into scale factor bands
-from entropy import BlockEntropyCoder
+from entropy import BlockEntropyCoder, RawMantissaCoder
+from features import ENTROPY_CODING, VARIABLE_BIT_RATE, MID_SIDE_CODING, PREDICTION
 from blockswitching import LONG, SHORT, N_SHORT_BLOCKS, ShortBlockSFBands, WindowForBlockType, SelectBlockType, mask_to_group_lens
 from mdct import MDCT, IMDCT
 from search import get_best_region, PRED_MAP, GAIN_TABLE, pred_type_to_samples, update_search_buffer
@@ -74,8 +75,8 @@ class RMCFile(AudioFile):
         myParams.prev_use_ms = False  # tracks M/S mode of previous block for OLA transition
 
         # entropy coders
-        myParams.entropyCoder_long = BlockEntropyCoder(14)
-        myParams.entropyCoder_short = BlockEntropyCoder(14)
+        myParams.entropyCoder_long = BlockEntropyCoder(14) if ENTROPY_CODING else RawMantissaCoder()
+        myParams.entropyCoder_short = BlockEntropyCoder(14) if ENTROPY_CODING else RawMantissaCoder()
         # start w/o all zeroes as data from prior block to overlap-and-add for output
         overlapAndAdd = []
         for iCh in range(nChannels): overlapAndAdd.append(np.zeros(nMDCTLines, dtype=np.float64) )
@@ -273,9 +274,9 @@ class RMCFile(AudioFile):
         #short block switching additions
         codingParams.nMDCTLines_short = codingParams.nMDCTLines // 8
         codingParams.sfBands_short = ShortBlockSFBands(codingParams.nMDCTLines_short, codingParams.sampleRate)
-        codingParams.blockType = LONG    
-        codingParams.entropyCoder_long = BlockEntropyCoder(14)
-        codingParams.entropyCoder_short = BlockEntropyCoder(14)
+        codingParams.blockType = LONG
+        codingParams.entropyCoder_long = BlockEntropyCoder(14) if ENTROPY_CODING else RawMantissaCoder()
+        codingParams.entropyCoder_short = BlockEntropyCoder(14) if ENTROPY_CODING else RawMantissaCoder()
 
         #RMC extras
         codingParams.numSamplesQuarterNote = int((60.0/codingParams.tempo) * codingParams.sampleRate)
@@ -329,7 +330,7 @@ class RMCFile(AudioFile):
 
         # Block-level M/S stereo decision: use M/S if side energy < min(L energy, R energy)
         use_ms = False
-        if codingParams.nChannels == 2:
+        if MID_SIDE_CODING and codingParams.nChannels == 2:
             L, R = fullBlockData_[0], fullBlockData_[1]
             M = (L + R) * 0.5
             S = (L - R) * 0.5
@@ -378,7 +379,7 @@ class RMCFile(AudioFile):
         enable_masks = []
         corrections = []
         for iCh in range(codingParams.nChannels):
-            if current_block_type != SHORT:
+            if PREDICTION and current_block_type != SHORT:
                 window = WindowForBlockType(current_block_type, N, N_short)
                 mdct_X = MDCT(window * fullBlockData_[iCh], halfN, halfN)[:halfN]
                 range_type, pcm_residual, rel_offset, mdct_P, alpha_idx, alpha_q = get_best_region(
@@ -410,7 +411,7 @@ class RMCFile(AudioFile):
                     enable_f = np.zeros(codingParams.sfBands.nBands, dtype=bool)
                     enable_m = np.zeros(halfN)
                     correction = None
-            else:  # SHORT block: skip prediction (transients are not repetitive)
+            else:  # SHORT block (transients not repetitive) or PREDICTION disabled
                 range_type, pcm_residual, rel_offset, mdct_P, alpha_idx, alpha_q = \
                     None, fullBlockData_[iCh], 0, None, 0, 1.0
                 enable_f = np.array([], dtype=bool)
@@ -525,17 +526,18 @@ class RMCFile(AudioFile):
                         nBits += entropy_pb.nBits
                     sub_idx += G
                 # Update SHORT entropy compression ratio (EMA)
-                _raw_short = sum(
-                    bitAlloc[iCh][i][iBand] * sfBands_short.nLines[iBand]
-                    for i in range(N_SHORT_BLOCKS)
-                    for iBand in range(sfBands_short.nBands)
-                    if bitAlloc[iCh][i][iBand] > 0
-                )
-                _ent_short = sum(ep.nBits for ep in entropy_pbs)
-                if _raw_short > 0:
-                    _r = _ent_short / _raw_short
-                    codingParams._entropy_ratio_short = 0.9 * codingParams._entropy_ratio_short + 0.1 * _r
-                    codingParams._entropy_inflation_short = min(2.5, max(0.5, 1.0 / codingParams._entropy_ratio_short))
+                if VARIABLE_BIT_RATE:
+                    _raw_short = sum(
+                        bitAlloc[iCh][i][iBand] * sfBands_short.nLines[iBand]
+                        for i in range(N_SHORT_BLOCKS)
+                        for iBand in range(sfBands_short.nBands)
+                        if bitAlloc[iCh][i][iBand] > 0
+                    )
+                    _ent_short = sum(ep.nBits for ep in entropy_pbs)
+                    if _raw_short > 0:
+                        _r = _ent_short / _raw_short
+                        codingParams._entropy_ratio_short = 0.9 * codingParams._entropy_ratio_short + 0.1 * _r
+                        codingParams._entropy_inflation_short = min(2.5, max(0.5, 1.0 / codingParams._entropy_ratio_short))
             else:
                 entropy_pb = codingParams.entropyCoder_long.encode_block(
                     mantissa[iCh], bitAlloc[iCh], codingParams.sfBands
@@ -545,15 +547,16 @@ class RMCFile(AudioFile):
                     nBits += codingParams.nMantSizeBits + codingParams.nScaleBits
                 nBits += entropy_pb.nBits
                 # Update LONG entropy compression ratio (EMA)
-                _raw_long = sum(
-                    bitAlloc[iCh][iBand] * codingParams.sfBands.nLines[iBand]
-                    for iBand in range(codingParams.sfBands.nBands)
-                    if bitAlloc[iCh][iBand] > 0
-                )
-                if _raw_long > 0:
-                    _r = entropy_pb.nBits / _raw_long
-                    codingParams._entropy_ratio = 0.9 * codingParams._entropy_ratio + 0.1 * _r
-                    codingParams._entropy_inflation = min(2.5, max(0.5, 1.0 / codingParams._entropy_ratio))
+                if VARIABLE_BIT_RATE:
+                    _raw_long = sum(
+                        bitAlloc[iCh][iBand] * codingParams.sfBands.nLines[iBand]
+                        for iBand in range(codingParams.sfBands.nBands)
+                        if bitAlloc[iCh][iBand] > 0
+                    )
+                    if _raw_long > 0:
+                        _r = entropy_pb.nBits / _raw_long
+                        codingParams._entropy_ratio = 0.9 * codingParams._entropy_ratio + 0.1 * _r
+                        codingParams._entropy_inflation = min(2.5, max(0.5, 1.0 / codingParams._entropy_ratio))
 
             nBytes = (nBits + BYTESIZE - 1) // BYTESIZE
             self.fp.write(pack("<L", int(nBytes)))

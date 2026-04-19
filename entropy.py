@@ -385,6 +385,38 @@ class BlockEntropyCoder:
         return mantissa
 
 
+class RawMantissaCoder:
+    """Passthrough coder — writes/reads raw mantissa bits, same interface as BlockEntropyCoder."""
+
+    def encode_block(self, mantissas, bitAlloc, sfBands):
+        total_bits = sum(
+            int(bitAlloc[iBand]) * int(sfBands.nLines[iBand])
+            for iBand in range(sfBands.nBands) if bitAlloc[iBand]
+        )
+        pb = PackedBits()
+        if total_bits == 0:
+            pb.Size(0)
+            return pb
+        pb.Size((total_bits + 7) // 8)
+        iMant = 0
+        for iBand in range(sfBands.nBands):
+            nLines = int(sfBands.nLines[iBand])
+            if bitAlloc[iBand]:
+                pb.WriteBitsArray(mantissas[iMant:iMant + nLines], int(bitAlloc[iBand]))
+                iMant += nLines
+        return pb
+
+    def decode_block(self, pb, bitAlloc, sfBands, nMDCTLines):
+        mantissa = np.zeros(nMDCTLines, dtype=np.int32)
+        for iBand in range(sfBands.nBands):
+            nLines = int(sfBands.nLines[iBand])
+            if bitAlloc[iBand]:
+                lo = int(sfBands.lowerLine[iBand])
+                hi = int(sfBands.upperLine[iBand]) + 1
+                mantissa[lo:hi] = pb.ReadBitsArray(int(bitAlloc[iBand]), nLines)
+        return mantissa
+
+
 if __name__ == "__main__":
     block_order = 14
     coder = RangeCoder(block_order)

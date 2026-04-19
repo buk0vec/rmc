@@ -21,6 +21,7 @@ from rmcfile import *  # to get access to RMC file handling
 from pcmfile import *  # to get access to WAV file handling
 from simple_run import detectTransients
 from pathlib import Path
+from features import BLOCK_SWITCHING, SHORT_BLOCK_BITBOOST
 
 def print_flavor():
     flavor = """
@@ -49,62 +50,61 @@ def Encode(inFilename,
             nScaleBits=3,
             nMantSizeBits=5,
             kbps=128,
+            targetBitsPerSample=None,
             tempo: int = 120,
-            verbose: bool = False
+            verbose: bool = False,
     ):
-    # ------------------------------------------------------------------
-    # Pre-analysis: detect transients across the whole song before encoding
-    # ------------------------------------------------------------------
-        
     if codedFilename is None:
         codedFilename = f"{Path(inFilename).stem}.rmc"
-        
+
     inFile = PCMFile(inFilename)
     outFile = RMCFile(codedFilename)
 
-    # open input file
-    codingParams = inFile.OpenForReading()  # (includes reading header)
+    codingParams = inFile.OpenForReading()
 
-    # pass parameters to the output file
     codingParams.nMDCTLines = nMDCTLines
     codingParams.nScaleBits = nScaleBits
     codingParams.nMantSizeBits = nMantSizeBits
     codingParams.nSamplesPerBlock = codingParams.nMDCTLines
     codingParams.tempo = tempo
-    targetBitsPerSample = kbps * 1000 / codingParams.sampleRate
+
+    if targetBitsPerSample is None:
+        targetBitsPerSample = kbps * 1000 / codingParams.sampleRate
 
     if verbose:
         print(f"\nEncoding {inFilename} -> {codedFilename} at {kbps} kb/s")
 
-    # This is too verbose for the CLI lol
-    transient_map = detectTransients(inFilename, verbose=False)
-    # Shift transient map back by 1 block for lookahead: the START block must
-    # precede the transient so that SHORT blocks capture the actual attack.
-    # Without this, the kick itself gets a LONG MDCT (START) and the post-kick
-    # bass content lands in SHORT blocks with terrible low-frequency resolution.
-    transient_map = {max(x - 1, 0): 0 for x in transient_map}
+    if BLOCK_SWITCHING:
+        transient_map = detectTransients(inFilename, verbose=False)
+        # Shift transient map back by 1 block for lookahead: the START block must
+        # precede the transient so that SHORT blocks capture the actual attack.
+        # Without this, the kick itself gets a LONG MDCT (START) and the post-kick
+        # bass content lands in SHORT blocks with terrible low-frequency resolution.
+        transient_map = {max(x - 1, 0): 0 for x in transient_map}
+        if verbose:
+            print(f"TransientDetection complete: found transients in {len(transient_map)} blocks")
+    else:
+        transient_map = {}
+        if verbose:
+            print("Block switching disabled, using all LONG blocks")
 
     codingParams.transientBlocks = transient_map
     codingParams.blockIndex = 0
 
-    if verbose:
-        print(f"TransientDetection complete: found transients in {len(transient_map)} blocks")
-
-    # Adjust targetBitsPerSample so SHORT blocks' 2x budget
+    # Adjust targetBitsPerSample so SHORT blocks' boosted budget
     # doesn't push the file over the target bitrate.
-    # We know how many SHORT blocks there will be from pre-analysis.
     total_blocks = int(np.ceil(codingParams.numSamples / nMDCTLines)) + 1  # +1 for flush block
-    n_short = len(transient_map)  # each transient → 1 SHORT block
+    n_short = len(transient_map)
     n_long = total_blocks - n_short
-    # Budget equation: n_long * B + n_short * 2*B = total_blocks * B_target
-    # → B = B_target * total_blocks / (n_long + 2*n_short)
-    short_budget_factor = 2.0  # must match the multiplier in codec.py
-    adjusted_bps = targetBitsPerSample * total_blocks / (n_long + short_budget_factor * n_short)
-    if verbose:
-        print(f"Adjusted bps: {targetBitsPerSample:.3f} -> {adjusted_bps:.3f} "
-f"({n_short} Short / {total_blocks} total blocks)")
-    
-    codingParams.targetBitsPerSample = adjusted_bps
+    short_budget_factor = 2.0 if SHORT_BLOCK_BITBOOST else 1.0  # must match codec.py
+    if n_short > 0 and short_budget_factor != 1.0:
+        adjusted_bps = targetBitsPerSample * total_blocks / (n_long + short_budget_factor * n_short)
+        if verbose:
+            print(f"Adjusted bps: {targetBitsPerSample:.3f} -> {adjusted_bps:.3f} "
+                  f"({n_short} short / {total_blocks} total blocks)")
+        codingParams.targetBitsPerSample = adjusted_bps
+    else:
+        codingParams.targetBitsPerSample = targetBitsPerSample
     
     # open the output file
     outFile.OpenForWriting(codingParams)  # (includes writing header)
@@ -123,17 +123,14 @@ f"({n_short} Short / {total_blocks} total blocks)")
         n = len(data[0])
         processed_samples += n
         pbar.update(n)
-
     pbar.close()
-    # end loop over reading/writing the blocks
 
-    # close the files
     inFile.Close(codingParams)
     outFile.Close(codingParams)
 
 def Decode(inFilename,
            outFilename=None,
-           verbose: bool = False
+           verbose: bool = False,
     ):
     if outFilename is None:
         outFilename = f"{Path(inFilename).stem}.wav"
@@ -162,7 +159,6 @@ def Decode(inFilename,
         n = len(data[0])
         processed_samples += n
         pbar.update(n)
-
     pbar.close()
 
     inFile.Close(codingParams)
