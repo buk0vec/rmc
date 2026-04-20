@@ -12,6 +12,7 @@ between -1.0 and 1.0 ("signed fractions")
 ### ADD YOUR CODE AT THE SPECIFIED LOCATIONS ###
 
 import numpy as np
+from numba import njit
 
 ### Problem 1.a.i ###
 def QuantizeUniform(aNum,nBits):
@@ -46,6 +47,7 @@ def DequantizeUniform(aQuantizedNum,nBits):
     return aNum
 
 ### Problem 1.a.ii ###
+@njit(cache=True)
 def vQuantizeUniform(aNumVec, nBits):
     """
     Uniformly quantize vector aNumberVec of signed fractions with nBits
@@ -55,28 +57,33 @@ def vQuantizeUniform(aNumVec, nBits):
     #Make sure to vectorize properly your function as specified in the homework instructions
 
     ### YOUR CODE STARTS HERE ###
+    nBits_u64 = np.uint64(nBits)
     s = np.where(aNumVec >= 0, 0, 1).astype(np.uint64)
     code = np.where(
-        np.abs(aNumVec) >= 1, 
-        (1 << (nBits - 1)) - 1, 
-        ((((1 << nBits) - 1) * np.abs(aNumVec)+1)/2)
+        np.abs(aNumVec) >= 1,
+        (np.uint64(1) << (nBits_u64 - np.uint64(1))) - np.uint64(1),
+        ((((np.uint64(1) << nBits_u64) - np.uint64(1)) * np.abs(aNumVec)+1)/2)
     ).astype(np.uint64)
-    aQuantizedNumVec = (s << np.uint64(nBits - 1)) | code
+    aQuantizedNumVec = (s << (nBits_u64 - np.uint64(1))) | code
     ### YOUR CODE ENDS HERE ###
 
     return aQuantizedNumVec
 
 ### Problem 1.a.ii ###
+@njit(cache=True)
 def vDequantizeUniform(aQuantizedNumVec, nBits):
     """
     Uniformly dequantizes vector of nBits-long numbers aQuantizedNumVec into vector of  signed fractions
     """
 
     ### YOUR CODE STARTS HERE ###
-    sign = (aQuantizedNumVec >> (nBits - 1))
-    aQuantizedNumVec = aQuantizedNumVec ^ (sign << (nBits - 1))
-    sign = 1 + -2 * np.int64(sign)
-    number = 2 * np.abs(aQuantizedNumVec) / ((1 << nBits) - 1)
+    # Convert input to uint64 to ensure proper bit operations
+    aQuantizedNumVec = aQuantizedNumVec.astype(np.uint64)
+    nBits_u64 = np.uint64(nBits)
+    sign = (aQuantizedNumVec >> (nBits_u64 - np.uint64(1)))
+    aQuantizedNumVec = aQuantizedNumVec ^ (sign << (nBits_u64 - np.uint64(1)))
+    sign = np.int64(1) + np.int64(-2) * sign.astype(np.int64)
+    number = 2 * aQuantizedNumVec.astype(np.float64) / np.float64((np.uint64(1) << nBits_u64) - np.uint64(1))
     aNumVec = sign * number
     ### YOUR CODE ENDS HERE ###
 
@@ -227,6 +234,7 @@ def Dequantize(scale, mantissa, nScaleBits=3, nMantBits=5):
     return aNum
 
 ### Problem 1.c.ii ###
+@njit(cache=True)
 def vMantissa(aNumVec, scale, nScaleBits=3, nMantBits=5):
     """
     Return a vector of block floating-point mantissas for a vector of  signed fractions aNum given nScaleBits scale bits and nMantBits mantissa bits
@@ -235,32 +243,36 @@ def vMantissa(aNumVec, scale, nScaleBits=3, nMantBits=5):
     ### YOUR CODE STARTS HERE ###
     if nMantBits == 0:
         return np.zeros_like(aNumVec, dtype = np.uint64)
-    quant_bits = np.uint64((1 << nScaleBits) - 1 + nMantBits)
+
+    nScaleBits_u64 = np.uint64(nScaleBits)
+    nMantBits_u64 = np.uint64(nMantBits)
+    scale_u64 = np.uint64(scale)
+    quant_bits = ((np.uint64(1) << nScaleBits_u64) - np.uint64(1) + nMantBits_u64)
+
     num_q = vQuantizeUniform(aNumVec, quant_bits).astype(np.uint64)
-    s = num_q >> (quant_bits - 1)
-    
+    s = num_q >> (quant_bits - np.uint64(1))
+
     # If scale is maxed out, just encode the last nMantBits - 1 bits
-    if scale == (1 << nScaleBits) - 1:
-        mantissa = num_q & ((1 << (nMantBits - 1)) - 1)
-    
-    
+    if scale_u64 == (np.uint64(1) << nScaleBits_u64) - np.uint64(1):
+        mantissa = num_q & ((np.uint64(1) << (nMantBits_u64 - np.uint64(1))) - np.uint64(1))
     else:
         # Filter out bits before the scale + 1st (not assuming leading 1)
-        mask = (1 << (quant_bits - (scale + 1))) - 1
+        mask = (np.uint64(1) << (quant_bits - (scale_u64 + np.uint64(1)))) - np.uint64(1)
         mantissa = num_q & mask
         # Filter out nMantBits-1 bits after the scale + 1st
-        mask = ~((1 << (quant_bits - (scale + nMantBits)))-1)
+        mask = ~((np.uint64(1) << (quant_bits - (scale_u64 + nMantBits_u64)))-np.uint64(1))
         mantissa &= mask
         # Reshift mantissa bits back
-        mantissa >>= quant_bits - (scale + nMantBits)
-        
-    mantissaVec = mantissa | s <<(nMantBits - 1)
+        mantissa >>= quant_bits - (scale_u64 + nMantBits_u64)
+
+    mantissaVec = mantissa | (s << (nMantBits_u64 - np.uint64(1)))
 
     ### YOUR CODE ENDS HERE ###
 
     return mantissaVec
 
 ### Problem 1.c.ii ###
+@njit(cache=True)
 def vDequantize(scale, mantissaVec, nScaleBits=3, nMantBits=5):
     """
     Returns a vector of  signed fractions for block floating-point scale and vector of block floating-point mantissas given specified scale and mantissa bits
@@ -268,22 +280,27 @@ def vDequantize(scale, mantissaVec, nScaleBits=3, nMantBits=5):
 
     ### YOUR CODE STARTS HERE ###
     if nMantBits == 0:
-        return np.zeros_like(mantissaVec, dtype = float)
-    quant_bits = (1 << nScaleBits) - 1 + nMantBits
-    mantissaVec = mantissaVec.astype(np.uint64)
-    sign = (mantissaVec >> (nMantBits - 1)) & 1
-    
-    # Use the first 4 digits of the number for the mantissa
-    num_q = mantissaVec & ~(np.uint64(1) << np.uint64(nMantBits - 1))
-    if scale != (1 << nScaleBits) - 1:
-        # Do NOT add 1 onto first mantissa bit, instead zero out the sign bit
-        num_q = mantissaVec & ~(np.uint64(1) << np.uint64(nMantBits - 1))
-        # Shift mantissa bits forward as needed
-        shift_amt = quant_bits - (scale + nMantBits)
-        num_q = num_q << np.uint64(shift_amt)
+        return np.zeros_like(mantissaVec, dtype = np.float64)
 
-    num_q |= sign << (quant_bits - 1)
-    
+    nScaleBits_u64 = np.uint64(nScaleBits)
+    nMantBits_u64 = np.uint64(nMantBits)
+    scale_u64 = np.uint64(scale)
+    quant_bits = (np.uint64(1) << nScaleBits_u64) - np.uint64(1) + nMantBits_u64
+
+    mantissaVec = mantissaVec.astype(np.uint64)
+    sign = (mantissaVec >> (nMantBits_u64 - np.uint64(1))) & np.uint64(1)
+
+    # Use the first 4 digits of the number for the mantissa
+    num_q = mantissaVec & ~(np.uint64(1) << (nMantBits_u64 - np.uint64(1)))
+    if scale_u64 != (np.uint64(1) << nScaleBits_u64) - np.uint64(1):
+        # Do NOT add 1 onto first mantissa bit, instead zero out the sign bit
+        num_q = mantissaVec & ~(np.uint64(1) << (nMantBits_u64 - np.uint64(1)))
+        # Shift mantissa bits forward as needed
+        shift_amt = quant_bits - (scale_u64 + nMantBits_u64)
+        num_q = num_q << shift_amt
+
+    num_q |= sign << (quant_bits - np.uint64(1))
+
     aNumVec = vDequantizeUniform(num_q, quant_bits)
     ### YOUR CODE ENDS HERE ###
 

@@ -11,21 +11,25 @@ from window import *
 import scipy.fft
 import scipy.signal
 import scipy.stats
+from numba import njit
 
+@njit(cache=True)
 def SPL(intensity):
     """
-    Returns the SPL corresponding to intensity 
+    Returns the SPL corresponding to intensity
     """
     return np.where(intensity == 0, -30, np.maximum(96 + 10 * np.log10(intensity), -30))
 
 _LOG10_OVER_10 = np.log(10) / 10
 
+@njit(cache=True)
 def Intensity(spl):
     """
     Returns the intensity  for SPL spl
     """
     return np.exp((spl - 96) * _LOG10_OVER_10)
 
+@njit(cache=True)
 def Thresh(f):
     """Returns the threshold in quiet measured in SPL at frequency f (in Hz)"""
     f = np.maximum(f, 20)
@@ -34,11 +38,12 @@ def Thresh(f):
     t3 = (10 ** (-3)) * ((f / 1000) ** 4)
     return t1 + t2 + t3
 
+@njit(cache=True)
 def Bark(f):
     """Returns the bark-scale frequency for input frequency f (in Hz) """
     t1 = 13 * np.arctan(0.76 * f / 1000)
     t2 = 3.5 * np.arctan((f / 7500) ** 2)
-    
+
     return t1 + t2
 
 class Masker:
@@ -129,6 +134,48 @@ class ScaleFactorBands:
 
 _psychoac_cache = {}
 
+@njit(cache=True)
+def _compute_masking_curve(masker_bark_f, masker_spl_v, masker_tonal, bark_MDCT):
+    """
+    JIT-compiled masking curve calculation.
+
+    Computes the masked threshold contribution from all maskers at each MDCT line.
+    This is the hot loop extracted from getMaskedThreshold.
+
+    Args:
+        masker_bark_f: (n_maskers,) Bark frequencies of maskers
+        masker_spl_v: (n_maskers,) SPL values of maskers
+        masker_tonal: (n_maskers,) boolean array, True if tonal masker
+        bark_MDCT: (n_mdct,) Bark frequencies of MDCT lines
+
+    Returns:
+        total_spl: (n_maskers, n_mdct) masking SPL contribution from each masker at each MDCT line
+    """
+    # Broadcast to create (n_maskers, n_mdct) matrix
+    # dz[i,j] = bark_MDCT[j] - masker_bark_f[i]
+    dz = bark_MDCT.reshape(1, -1) - masker_bark_f.reshape(-1, 1)
+    abs_dz = np.abs(dz)
+
+    # Initialize slope matrix
+    slope = np.zeros_like(dz)
+
+    # Lower slope: dz < -0.5
+    slope = np.where(dz < -0.5, -27.0 * (abs_dz - 0.5), slope)
+
+    # Upper slope: dz > 0.5
+    # Note: (-27 + 0.367 * max(SPL - 40, 0)) depends on each masker
+    upper = (-27.0 + 0.367 * np.maximum(masker_spl_v - 40.0, 0.0)).reshape(-1, 1)
+    slope = np.where(dz > 0.5, upper * (abs_dz - 0.5), slope)
+
+    # Add base SPL for each masker (broadcast across MDCT lines)
+    total_spl = masker_spl_v.reshape(-1, 1) + slope
+
+    # Subtract tonal/noise offset: -16 for tonal, -6 for noise
+    tonal_offset = np.where(masker_tonal, -16.0, -6.0).reshape(-1, 1)
+    total_spl = total_spl + tonal_offset
+
+    return total_spl
+
 def _build_psychoac_cache(N, N_mdct, sampleRate):
     """Precompute all values in getMaskedThreshold that depend only on N and sampleRate."""
     w_n = KBDWindow(np.ones(N), alpha=4)
@@ -179,28 +226,42 @@ def getMaskedThreshold(data, MDCTdata, MDCTscale, sampleRate, sfBands):
         ((peaks - 1) * x_mag[peaks - 1] + peaks * x_mag[peaks] + (peaks + 1) * x_mag[peaks+1]) \
         / (x_mag[peaks - 1] + x_mag[peaks] + x_mag[peaks + 1])
 
-    maskers = [Masker(f, spl, isTonal=True) for f, spl in zip(peak_freqs, peak_spl)]
+    # ===== OPTIMIZED: Build masker arrays directly (no Masker objects) =====
+    # Count total maskers: peaks + valid noise bands
+    n_peaks = len(peaks)
+    n_noise = np.sum(band_valid)
+    n_maskers = n_peaks + n_noise
 
+    # Pre-allocate masker arrays
+    masker_freqs = np.zeros(n_maskers)
+    masker_spl = np.zeros(n_maskers)
+    masker_tonal = np.zeros(n_maskers, dtype=np.bool_)
+
+    # Fill tonal (peak) maskers
+    masker_freqs[:n_peaks] = peak_freqs
+    masker_spl[:n_peaks] = peak_spl
+    masker_tonal[:n_peaks] = True
+
+    # Fill noise maskers (from bands with no peaks)
     noise_intensity = np.copy(x_intensity)
     noise_intensity[peaks] = 0
 
+    idx = n_peaks
     for b in range(bands_fft.nBands):
         if band_valid[b]:
             noise_int = np.sum(noise_intensity[bands_fft.lowerLine[b]:bands_fft.upperLine[b] + 1])
-            maskers.append(Masker(band_noise_freqs[b], SPL(noise_int), isTonal=False))
+            masker_freqs[idx] = band_noise_freqs[b]
+            masker_spl[idx] = SPL(noise_int)
+            masker_tonal[idx] = False
+            idx += 1
 
-    masker_bark_f = Bark(np.array([m.f for m in maskers]))
-    masker_spl_v  = np.array([m.SPL for m in maskers])
-    masker_tonal  = np.array([m.isTonal for m in maskers])
+    # Convert to Bark scale
+    masker_bark_f = Bark(masker_freqs)
 
-    dz = bark_MDCT[None, :] - masker_bark_f[:, None]
-    abs_dz = np.abs(dz)
-    slope = np.zeros_like(dz)
-    slope = np.where(dz < -0.5, -27 * (abs_dz - 0.5), slope)
-    upper = (-27 + 0.367 * np.maximum(masker_spl_v - 40, 0))[:, None]
-    slope = np.where(dz > 0.5, upper * (abs_dz - 0.5), slope)
-    total_spl = masker_spl_v[:, None] + slope + np.where(masker_tonal, -16, -6)[:, None]
+    # ===== OPTIMIZED: Use JIT-compiled masking curve calculation =====
+    total_spl = _compute_masking_curve(masker_bark_f, masker_spl, masker_tonal, bark_MDCT)
 
+    # Sum masker intensities and add threshold in quiet
     masked_threshold = SPL(np.sum(Intensity(total_spl), axis=0) + intensity_quiet)
 
     return masked_threshold

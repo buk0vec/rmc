@@ -51,6 +51,6 @@ of bits per sample.
 
 if __name__ == "__main__":
     EncodeDecode(inFilename='inputs/Van_124.wav', codedFilename='van_base.pac',
-                 outFilename='van_124_base.wav', targetBitsPerSample=192000/44100, tempo=124)
+                 outFilename='van_124_base.wav', targetBitsPerSample=128000/44100, tempo=124)
     # EncodeDecode(inFilename='Van_124.wav', codedFilename='coded_192k_ms.pac',
     #              outFilename='VANoutput_192k_ms.wav', targetBitsPerSample=192000/44100, tempo=124)
