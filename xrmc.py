@@ -1,10 +1,12 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#     "matplotlib>=3.10.8",
-#     "numpy>=2.4.3",
-#     "scipy>=1.17.1",
-#     "tqdm>=4.67.3",
+# "llvmlite==0.45.0",
+# "matplotlib>=3.10.6",
+# "numba>=0.61.2",
+# "numpy>=2",
+# "scipy>=1.16.3",
+# "tqdm>=4.67.3",
 # ]
 # ///
 
@@ -70,6 +72,8 @@ def Encode(inFilename,
 
     if targetBitsPerSample is None:
         targetBitsPerSample = kbps * 1000 / codingParams.sampleRate
+    else:
+        kbps = int(targetBitsPerSample * codingParams.sampleRate / 1000)
 
     if verbose:
         print(f"\nEncoding {inFilename} -> {codedFilename} at {kbps} kb/s")

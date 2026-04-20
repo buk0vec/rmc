@@ -49,21 +49,25 @@ def HanningWindow(dataSampleArray):
     ### YOUR CODE ENDS HERE ###
 
 
+_kbd_window_cache = {}
+
 ### Problem 1.d - OPTIONAL ###
 def KBDWindow(dataSampleArray,alpha=4.):
     """
     Returns a copy of the dataSampleArray KBD-windowed
-    KBD window is defined following the KDB Window handout in the 
+    KBD window is defined following the KDB Window handout in the
 	Canvas Files/Assignments/HW3 folder
     """
 
     ### YOUR CODE STARTS HERE ###
     N = len(dataSampleArray)
-    ns_div2p1 = np.arange(N // 2 + 1, dtype=np.int32)
-    kb = scipy.special.i0(alpha * np.pi * np.sqrt(1 - ((2 * ns_div2p1 + 1) / (N / 2 + 1) - 1) ** 2 )) / scipy.special.i0(np.pi * alpha)
-    window_half = np.sqrt(np.cumsum(kb[:N//2]) / np.sum(kb))
-    window = np.concatenate([window_half, np.flip(window_half)])
-    return window * dataSampleArray 
+    key = (N, alpha)
+    if key not in _kbd_window_cache:
+        ns_div2p1 = np.arange(N // 2 + 1, dtype=np.int32)
+        kb = scipy.special.i0(alpha * np.pi * np.sqrt(1 - ((2 * ns_div2p1 + 1) / (N / 2 + 1) - 1) ** 2 )) / scipy.special.i0(np.pi * alpha)
+        window_half = np.sqrt(np.cumsum(kb[:N//2]) / np.sum(kb))
+        _kbd_window_cache[key] = np.concatenate([window_half, np.flip(window_half)])
+    return _kbd_window_cache[key] * dataSampleArray
     ### YOUR CODE ENDS HERE ###
 
 #-----------------------------------------------------------------------------

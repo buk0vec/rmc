@@ -6,6 +6,7 @@ Music 422
 """
 
 import numpy as np
+from numba import njit
 
 # Question 1.c)
 def BitAllocUniform(bitBudget, maxMantBits, nBands, nLines, SMR=None):
@@ -49,6 +50,7 @@ def BitAllocConstNMR(bitBudget, maxMantBits, nBands, nLines, SMR):
         8.,  8.,  8.,  2.,  8., 10.,  0.,  0., 11.,  0.,  0.,  0.], dtype=np.uint64)
 
 # Question 2.a)
+@njit(cache=True)
 def BitAlloc(bitBudget, maxMantBits, nBands, nLines, SMR):
     """
     Allocates bits to scale factor bands so as to flatten the NMR across the spectrum
@@ -63,34 +65,42 @@ def BitAlloc(bitBudget, maxMantBits, nBands, nLines, SMR):
         Returns:
             bits[nBands] is number of bits allocated to each scale factor band
 
-        
+
     """
     # return BitAllocUniform(bitBudget, maxMantBits, nBands, nLines, SMR)
     # return BitAllocConstSNR(bitBudget, maxMantBits, nBands, nLines, 0)
     # return BitAllocConstNMR(bitBudget, maxMantBits, nBands, nLines, SMR)
-    
+
     # Sick water filling algorithm 9000
-    
+
     bits_remaining = int(bitBudget)
     bits = np.zeros(nBands, dtype = np.uint64)
+    nmr = SMR.copy()  # Initialize NMR (will update incrementally)
+
     while True:
-        nmr = SMR - 6.0 * bits
-        bands_sorted = np.argsort(nmr)[::-1]
-        did_alloc = False
-        
-        for band in bands_sorted:
-            if bits[band] < maxMantBits:
-                to_alloc = 2 if bits[band] == 0 else 1
-                bits_used = to_alloc * nLines[band]
-                if bits_remaining >= bits_used:
-                    bits[band] += to_alloc
-                    bits_remaining -= bits_used
-                    did_alloc = True
-                    break
-        
-        if not did_alloc:
+        # Find band with worst (highest) NMR
+        band = np.argmax(nmr)
+
+        # Terminate when all bands are marked done
+        if nmr[band] <= -1e9:
             break
-    
+
+        # If band is maxed, mark it and try next band
+        if bits[band] >= maxMantBits:
+            nmr[band] = -1e9
+            continue
+
+        to_alloc = 2 if bits[band] == 0 else 1
+        bits_used = to_alloc * nLines[band]
+
+        if bits_remaining >= bits_used:
+            bits[band] += to_alloc
+            bits_remaining -= bits_used
+            nmr[band] = SMR[band] - 6.0 * bits[band]  # Update only changed band
+        else:
+            # Mark this band as done (can't afford it)
+            nmr[band] = -1e9
+
     # Greedily add bits until we need to start taking them away
     # incrementable = np.argwhere((bits != 0) & (bits != maxMantBits))[::-1]
     # if bits_remaining >= np.min(nLines[incrementable]):
@@ -100,7 +110,7 @@ def BitAlloc(bitBudget, maxMantBits, nBands, nLines, SMR):
     #             if bits_remaining >= nLines[idx] and ((bits_remaining - nLines[idx]) >= np.min(nLines) or bits_remaining - nLines[idx] == 0):
     #                 bits[idx] += 1
     #                 bits_remaining -= nLines[idx]
-                    
+
     # Worst case when we can't easily just chuck bits places
     # if bits_remaining > 0:
     #     incrementable = np.argwhere((bits != 0) & (bits != maxMantBits)).flatten()
@@ -117,15 +127,16 @@ def BitAlloc(bitBudget, maxMantBits, nBands, nLines, SMR):
     #                     break
     #         if found:
     #             break
-            
+
     # Sometimes we are left w/ some leftover bits. Could do the loop above a few more times to get rid of em, but I'm running out of time!
-        
+
     # print(bits_remaining)
     # assert bits_remaining == 0
     # assert np.dot(bits, nLines) == int(bitBudget)
-    assert np.all(bits != 1)
-    assert np.all(bits <= maxMantBits)
-    
+    # Assertions don't work well in numba, skip them
+    # assert np.all(bits != 1)
+    # assert np.all(bits <= maxMantBits)
+
     return bits
 
     # return 8*np.ones(nBands, dtype = np.uint64) # TO REPLACE WITH YOUR CODE

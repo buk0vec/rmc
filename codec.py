@@ -192,22 +192,24 @@ def EncodeSingleChannel(data,codingParams):
                 maxBand = max(np.max(np.abs(sub_mdct_scaled[i][lo:hi])) for i in subs)
                 scaleFactor[iBand] = ScaleFactor(maxBand, nScaleBits, bitAlloc[iBand])
 
+            # Precompute allocated-band metadata once (shared across all sub-blocks in group)
+            alloc_bands = [
+                (iBand, int(sfBands_short.lowerLine[iBand]),
+                 int(sfBands_short.upperLine[iBand]) + 1,
+                 int(sfBands_short.nLines[iBand]))
+                for iBand in range(sfBands_short.nBands) if bitAlloc[iBand]
+            ]
+            nMant = sum(nLines for _, _, _, nLines in alloc_bands)
+
             # Quantize each sub-block using shared sf/ba
             for i in subs:
-                nMant = halfN
-                for iBand in range(sfBands_short.nBands):
-                    if not bitAlloc[iBand]: nMant -= sfBands_short.nLines[iBand]
                 mantissa = np.empty(nMant, dtype=np.int32)
                 iMant = 0
-                for iBand in range(sfBands_short.nBands):
-                    lowLine = sfBands_short.lowerLine[iBand]
-                    highLine = sfBands_short.upperLine[iBand] + 1
-                    nLines = sfBands_short.nLines[iBand]
-                    if bitAlloc[iBand]:
-                        mantissa[iMant:iMant+nLines] = vMantissa(
-                            sub_mdct_scaled[i][lowLine:highLine],
-                            scaleFactor[iBand], nScaleBits, bitAlloc[iBand])
-                        iMant += nLines
+                for iBand, lowLine, highLine, nLines in alloc_bands:
+                    mantissa[iMant:iMant+nLines] = vMantissa(
+                        sub_mdct_scaled[i][lowLine:highLine],
+                        scaleFactor[iBand], nScaleBits, bitAlloc[iBand])
+                    iMant += nLines
 
                 all_sf.append(scaleFactor)
                 all_ba.append(bitAlloc)
@@ -264,10 +266,11 @@ def EncodeSingleChannel(data,codingParams):
             lowLine = sfBands_long.lowerLine[iBand]
             highLine = sfBands_long.upperLine[iBand] + 1  # extra value is because slices don't include last value
             nLines= sfBands_long.nLines[iBand]
-            scaleLine = np.max(np.abs( mdctLines[lowLine:highLine] ) )
+            band_lines = mdctLines[lowLine:highLine]
+            scaleLine = np.max(np.abs(band_lines))
             scaleFactor[iBand] = ScaleFactor(scaleLine, nScaleBits, bitAlloc[iBand])
             if bitAlloc[iBand]:
-                mantissa[iMant:iMant+nLines] = vMantissa(mdctLines[lowLine:highLine],scaleFactor[iBand], nScaleBits, bitAlloc[iBand])
+                mantissa[iMant:iMant+nLines] = vMantissa(band_lines, scaleFactor[iBand], nScaleBits, bitAlloc[iBand])
                 iMant += nLines
         # end of loop over scale factor bands
 
