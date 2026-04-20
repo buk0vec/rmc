@@ -78,13 +78,17 @@ def BitAlloc(bitBudget, maxMantBits, nBands, nLines, SMR):
     nmr = SMR.copy()  # Initialize NMR (will update incrementally)
 
     while True:
-        did_alloc = False
-        # Find band with worst (highest) NMR that can still receive bits
+        # Find band with worst (highest) NMR
         band = np.argmax(nmr)
 
-        if nmr[band] <= -1e9 or bits[band] >= maxMantBits:
-            # No more bands can receive bits
+        # Terminate when all bands are marked done
+        if nmr[band] <= -1e9:
             break
+
+        # If band is maxed, mark it and try next band
+        if bits[band] >= maxMantBits:
+            nmr[band] = -1e9
+            continue
 
         to_alloc = 2 if bits[band] == 0 else 1
         bits_used = to_alloc * nLines[band]
@@ -93,13 +97,9 @@ def BitAlloc(bitBudget, maxMantBits, nBands, nLines, SMR):
             bits[band] += to_alloc
             bits_remaining -= bits_used
             nmr[band] = SMR[band] - 6.0 * bits[band]  # Update only changed band
-            did_alloc = True
         else:
             # Mark this band as done (can't afford it)
             nmr[band] = -1e9
-
-        if not did_alloc:
-            break
 
     # Greedily add bits until we need to start taking them away
     # incrementable = np.argwhere((bits != 0) & (bits != maxMantBits))[::-1]
