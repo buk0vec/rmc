@@ -179,6 +179,7 @@ def _compute_masking_curve(masker_bark_f, masker_spl_v, masker_tonal, bark_MDCT)
 def _build_psychoac_cache(N, N_mdct, sampleRate):
     """Precompute all values in getMaskedThreshold that depend only on N and sampleRate."""
     w_n = KBDWindow(np.ones(N), alpha=4)
+    P_w = np.mean(w_n ** 2)
     freqs = scipy.fft.rfftfreq(N, 1/sampleRate)
     bands_fft = ScaleFactorBands(AssignMDCTLinesFromFreqLimits(N//2 + 1, sampleRate))
     # Per-band noise masker frequencies: gmean of FFT bin indices, only depends on band boundaries
@@ -195,7 +196,7 @@ def _build_psychoac_cache(N, N_mdct, sampleRate):
     quiet_thresh = Thresh(MDCT_freqs)
     intensity_quiet = Intensity(quiet_thresh)
     bark_MDCT = Bark(MDCT_freqs)
-    return (w_n, freqs, bands_fft, band_noise_freqs, band_valid, MDCT_freqs, quiet_thresh, intensity_quiet, bark_MDCT)
+    return (w_n, P_w, freqs, bands_fft, band_noise_freqs, band_valid, MDCT_freqs, quiet_thresh, intensity_quiet, bark_MDCT)
 
 
 def getMaskedThreshold(data, MDCTdata, MDCTscale, sampleRate, sfBands):
@@ -210,12 +211,12 @@ def getMaskedThreshold(data, MDCTdata, MDCTscale, sampleRate, sfBands):
     key = (N, N_mdct, sampleRate)
     if key not in _psychoac_cache:
         _psychoac_cache[key] = _build_psychoac_cache(N, N_mdct, sampleRate)
-    w_n, freqs, bands_fft, band_noise_freqs, band_valid, MDCT_freqs, quiet_thresh, intensity_quiet, bark_MDCT = _psychoac_cache[key]
+    w_n, P_w, freqs, bands_fft, band_noise_freqs, band_valid, MDCT_freqs, quiet_thresh, intensity_quiet, bark_MDCT = _psychoac_cache[key]
 
     x_windowed = data * w_n
     x_fft = scipy.fft.rfft(x_windowed)
     x_mag = (np.abs(x_fft) ** 2)
-    x_intensity = 4/(N ** 2) * x_mag
+    x_intensity = 4/(N ** 2 * P_w) * x_mag
     x_spl = SPL(x_intensity)
 
     # Following textbook pg. 281-282, except just using scipy for peak finding
