@@ -298,11 +298,14 @@ def CalcSMRs(data, MDCTdata, MDCTscale, sampleRate, sfBands):
 
     
     masked_threshold = getMaskedThreshold(data, MDCTdata, MDCTscale, sampleRate, sfBands)
-    
+
+    N = len(data)
+    N_mdct = len(MDCTdata)
+    P_w = _psychoac_cache[(N, N_mdct, sampleRate)][1]  # mean(w^2), same window as MDCT
+
     mdct = MDCTdata / (2 ** MDCTscale)
     mdct_mag = np.abs(mdct) ** 2
-    # Use scaling that we used in last homework. Assuming KBD w/ average power = 1/2
-    mdct_intensity= 1 / (1/2) * mdct_mag
+    mdct_intensity = 1 / P_w * mdct_mag
     mdct_spl = SPL(mdct_intensity)
     
     smr = np.zeros(sfBands.nBands)
@@ -311,8 +314,8 @@ def CalcSMRs(data, MDCTdata, MDCTscale, sampleRate, sfBands):
         low = sfBands.lowerLine[b]
         hi = sfBands.upperLine[b]
         smr[b] = np.max(mdct_spl[low:hi + 1] - masked_threshold[low:hi + 1])
-        
-        
+
+
     return smr
 
 #-----------------------------------------------------------------------------
