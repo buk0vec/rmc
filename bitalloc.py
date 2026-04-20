@@ -70,24 +70,32 @@ def BitAlloc(bitBudget, maxMantBits, nBands, nLines, SMR):
     # return BitAllocConstNMR(bitBudget, maxMantBits, nBands, nLines, SMR)
     
     # Sick water filling algorithm 9000
-    
+
     bits_remaining = int(bitBudget)
     bits = np.zeros(nBands, dtype = np.uint64)
+    nmr = SMR.copy()  # Initialize NMR (will update incrementally)
+
     while True:
-        nmr = SMR - 6.0 * bits
-        bands_sorted = np.argsort(nmr)[::-1]
         did_alloc = False
-        
-        for band in bands_sorted:
-            if bits[band] < maxMantBits:
-                to_alloc = 2 if bits[band] == 0 else 1
-                bits_used = to_alloc * nLines[band]
-                if bits_remaining >= bits_used:
-                    bits[band] += to_alloc
-                    bits_remaining -= bits_used
-                    did_alloc = True
-                    break
-        
+        # Find band with worst (highest) NMR that can still receive bits
+        band = np.argmax(nmr)
+
+        if nmr[band] <= -1e9 or bits[band] >= maxMantBits:
+            # No more bands can receive bits
+            break
+
+        to_alloc = 2 if bits[band] == 0 else 1
+        bits_used = to_alloc * nLines[band]
+
+        if bits_remaining >= bits_used:
+            bits[band] += to_alloc
+            bits_remaining -= bits_used
+            nmr[band] = SMR[band] - 6.0 * bits[band]  # Update only changed band
+            did_alloc = True
+        else:
+            # Mark this band as done (can't afford it)
+            nmr[band] = -1e9
+
         if not did_alloc:
             break
     

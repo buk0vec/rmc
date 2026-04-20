@@ -70,6 +70,8 @@ def Encode(inFilename,
 
     if targetBitsPerSample is None:
         targetBitsPerSample = kbps * 1000 / codingParams.sampleRate
+    else:
+        kbps = int(targetBitsPerSample * codingParams.sampleRate / 1000)
 
     if verbose:
         print(f"\nEncoding {inFilename} -> {codedFilename} at {kbps} kb/s")

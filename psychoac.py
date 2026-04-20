@@ -18,11 +18,13 @@ def SPL(intensity):
     """
     return np.where(intensity == 0, -30, np.maximum(96 + 10 * np.log10(intensity), -30))
 
+_LOG10_OVER_10 = np.log(10) / 10
+
 def Intensity(spl):
     """
     Returns the intensity  for SPL spl
     """
-    return 10. ** ((spl - 96) / 10)
+    return np.exp((spl - 96) * _LOG10_OVER_10)
 
 def Thresh(f):
     """Returns the threshold in quiet measured in SPL at frequency f (in Hz)"""
@@ -125,6 +127,30 @@ class ScaleFactorBands:
         self.lowerLine = np.cumsum(np.concatenate([[0], nLines[:-1]]))
         self.upperLine = np.cumsum(nLines) - 1
 
+_psychoac_cache = {}
+
+def _build_psychoac_cache(N, N_mdct, sampleRate):
+    """Precompute all values in getMaskedThreshold that depend only on N and sampleRate."""
+    w_n = KBDWindow(np.ones(N), alpha=4)
+    freqs = scipy.fft.rfftfreq(N, 1/sampleRate)
+    bands_fft = ScaleFactorBands(AssignMDCTLinesFromFreqLimits(N//2 + 1, sampleRate))
+    # Per-band noise masker frequencies: gmean of FFT bin indices, only depends on band boundaries
+    band_noise_freqs = np.zeros(bands_fft.nBands)
+    band_valid = np.zeros(bands_fft.nBands, dtype=bool)
+    for b in range(bands_fft.nBands):
+        if bands_fft.nLines[b] > 0:
+            idx = int(np.round(scipy.stats.gmean(
+                np.arange(bands_fft.lowerLine[b], bands_fft.upperLine[b] + 1)
+            )))
+            band_noise_freqs[b] = freqs[idx]
+            band_valid[b] = True
+    MDCT_freqs = (np.arange(N_mdct) / N_mdct) * sampleRate / 2
+    quiet_thresh = Thresh(MDCT_freqs)
+    intensity_quiet = Intensity(quiet_thresh)
+    bark_MDCT = Bark(MDCT_freqs)
+    return (w_n, freqs, bands_fft, band_noise_freqs, band_valid, MDCT_freqs, quiet_thresh, intensity_quiet, bark_MDCT)
+
+
 def getMaskedThreshold(data, MDCTdata, MDCTscale, sampleRate, sfBands):
     """
     Return Masked Threshold evaluated at MDCT lines.
@@ -134,45 +160,49 @@ def getMaskedThreshold(data, MDCTdata, MDCTscale, sampleRate, sfBands):
     """
     N = len(data)
     N_mdct = len(MDCTdata)
-    w_n = KBDWindow(np.ones(N), alpha=4)
+    key = (N, N_mdct, sampleRate)
+    if key not in _psychoac_cache:
+        _psychoac_cache[key] = _build_psychoac_cache(N, N_mdct, sampleRate)
+    w_n, freqs, bands_fft, band_noise_freqs, band_valid, MDCT_freqs, quiet_thresh, intensity_quiet, bark_MDCT = _psychoac_cache[key]
+
     x_windowed = data * w_n
     x_fft = scipy.fft.rfft(x_windowed)
     x_mag = (np.abs(x_fft) ** 2)
     x_intensity = 4/(N ** 2) * x_mag
     x_spl = SPL(x_intensity)
-    freqs = scipy.fft.rfftfreq(N, 1/sampleRate)
-    
+
     # Following textbook pg. 281-282, except just using scipy for peak finding
     peaks, _ = scipy.signal.find_peaks(x_spl, prominence=5)
     peak_amp_squared = x_intensity[peaks - 1] + x_intensity[peaks] + x_intensity[peaks + 1]
     peak_spl = SPL(peak_amp_squared)
     peak_freqs = sampleRate/N * \
-    ((peaks - 1) * x_mag[peaks - 1] + peaks * x_mag[peaks] + (peaks + 1) * x_mag[peaks+1]) \
-    / (x_mag[peaks - 1] + x_mag[peaks] + x_mag[peaks + 1])
-    
+        ((peaks - 1) * x_mag[peaks - 1] + peaks * x_mag[peaks] + (peaks + 1) * x_mag[peaks+1]) \
+        / (x_mag[peaks - 1] + x_mag[peaks] + x_mag[peaks + 1])
+
     maskers = [Masker(f, spl, isTonal=True) for f, spl in zip(peak_freqs, peak_spl)]
-    
+
     noise_intensity = np.copy(x_intensity)
     noise_intensity[peaks] = 0
-    
-    # repurpose scalefactorbands class
-    bands_fft = ScaleFactorBands(AssignMDCTLinesFromFreqLimits(len(x_intensity), sampleRate))
-    # Identify noise maskers
-    for band in range(bands_fft.nBands):
-        if bands_fft.nLines[band] > 0:
-            noise_int = np.sum(noise_intensity[bands_fft.lowerLine[band]:bands_fft.upperLine[band] + 1])
-            if bands_fft.nLines[band] > 0:
-                # MPEG-1 geometric mean of fft band indices
-                noise_fft_idx= int(np.round(scipy.stats.gmean(np.arange(bands_fft.lowerLine[band], bands_fft.upperLine[band] + 1))))
-                noise_freq = freqs[noise_fft_idx]
-                maskers.append(Masker(noise_freq, SPL(noise_int), isTonal=False))
 
-    
-    MDCT_freqs =  (np.arange(N_mdct) / N_mdct) * sampleRate / 2
-    mask_curve_intensities = [m.vIntensityAtBark(Bark(MDCT_freqs)) for m in maskers]
-    quiet_thresh = Thresh(MDCT_freqs)
-    masked_threshold = SPL(np.sum([*mask_curve_intensities, Intensity(quiet_thresh)], axis=0)) 
-    
+    for b in range(bands_fft.nBands):
+        if band_valid[b]:
+            noise_int = np.sum(noise_intensity[bands_fft.lowerLine[b]:bands_fft.upperLine[b] + 1])
+            maskers.append(Masker(band_noise_freqs[b], SPL(noise_int), isTonal=False))
+
+    masker_bark_f = Bark(np.array([m.f for m in maskers]))
+    masker_spl_v  = np.array([m.SPL for m in maskers])
+    masker_tonal  = np.array([m.isTonal for m in maskers])
+
+    dz = bark_MDCT[None, :] - masker_bark_f[:, None]
+    abs_dz = np.abs(dz)
+    slope = np.zeros_like(dz)
+    slope = np.where(dz < -0.5, -27 * (abs_dz - 0.5), slope)
+    upper = (-27 + 0.367 * np.maximum(masker_spl_v - 40, 0))[:, None]
+    slope = np.where(dz > 0.5, upper * (abs_dz - 0.5), slope)
+    total_spl = masker_spl_v[:, None] + slope + np.where(masker_tonal, -16, -6)[:, None]
+
+    masked_threshold = SPL(np.sum(Intensity(total_spl), axis=0) + intensity_quiet)
+
     return masked_threshold
     
 

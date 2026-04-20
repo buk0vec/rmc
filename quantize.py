@@ -51,8 +51,6 @@ def vQuantizeUniform(aNumVec, nBits):
     Uniformly quantize vector aNumberVec of signed fractions with nBits
     """
 
-    aQuantizedNumVec = np.zeros_like(aNumVec, dtype = int) # REMOVE THIS LINE WHEN YOUR FUNCTION IS DONE
-
     #Notes:
     #Make sure to vectorize properly your function as specified in the homework instructions
 
@@ -74,8 +72,6 @@ def vDequantizeUniform(aQuantizedNumVec, nBits):
     Uniformly dequantizes vector of nBits-long numbers aQuantizedNumVec into vector of  signed fractions
     """
 
-    aNumVec = np.zeros_like(aQuantizedNumVec, dtype = float) # REMOVE THIS LINE WHEN YOUR FUNCTION IS DONE
-
     ### YOUR CODE STARTS HERE ###
     sign = (aQuantizedNumVec >> (nBits - 1))
     aQuantizedNumVec = aQuantizedNumVec ^ (sign << (nBits - 1))
@@ -95,14 +91,13 @@ def ScaleFactor(aNum, nScaleBits=3, nMantBits=5):
     #The scale factor should be the number of leading zeros
 
     ### YOUR CODE STARTS HERE ###
-    quant_bits = (1 << nScaleBits) - 1 + nMantBits
+    quant_bits = int((1 << nScaleBits) - 1 + nMantBits)
     num_q = QuantizeUniform(aNum, quant_bits)
-    # Go from two's complement to twelve-bit folded. Don't care about sign bit for this
-    
-    binary = np.binary_repr(num_q, width=quant_bits)
-    scale = min(binary[1:].find('1'), (1 << nScaleBits) - 1)
-    if scale < 0:
+    magnitude = int(num_q) & ((1 << (quant_bits - 1)) - 1)
+    if magnitude == 0:
         scale = (1 << nScaleBits) - 1
+    else:
+        scale = min((quant_bits - 1) - magnitude.bit_length(), (1 << nScaleBits) - 1)
     ### YOUR CODE ENDS HERE ###
 
     return scale
@@ -237,8 +232,6 @@ def vMantissa(aNumVec, scale, nScaleBits=3, nMantBits=5):
     Return a vector of block floating-point mantissas for a vector of  signed fractions aNum given nScaleBits scale bits and nMantBits mantissa bits
     """
 
-    mantissaVec = np.zeros_like(aNumVec, dtype = int) # REMOVE THIS LINE WHEN YOUR FUNCTION IS DONE
-
     ### YOUR CODE STARTS HERE ###
     if nMantBits == 0:
         return np.zeros_like(aNumVec, dtype = np.uint64)
@@ -272,8 +265,6 @@ def vDequantize(scale, mantissaVec, nScaleBits=3, nMantBits=5):
     """
     Returns a vector of  signed fractions for block floating-point scale and vector of block floating-point mantissas given specified scale and mantissa bits
     """
-
-    aNumVec = np.zeros_like(mantissaVec, dtype = float) # REMOVE THIS LINE WHEN YOUR FUNCTION IS DONE
 
     ### YOUR CODE STARTS HERE ###
     if nMantBits == 0:
