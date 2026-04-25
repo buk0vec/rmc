@@ -19,6 +19,7 @@ Awesome CLI for encoding/decoding RMC files.
 
 import time  # just for printing elapsed time
 import numpy as np
+import os
 from rmcfile import *  # to get access to RMC file handling
 from pcmfile import *  # to get access to WAV file handling
 from simple_run import detectTransients
@@ -54,6 +55,7 @@ def Encode(inFilename,
             kbps=128,
             targetBitsPerSample=None,
             tempo: int = 120,
+            transientShiftBlocks: int | None = None,
             verbose: bool = False,
     ):
     if codedFilename is None:
@@ -79,14 +81,58 @@ def Encode(inFilename,
         print(f"\nEncoding {inFilename} -> {codedFilename} at {kbps} kb/s")
 
     if BLOCK_SWITCHING:
-        transient_map = detectTransients(inFilename, verbose=False)
-        # Shift transient map back by 1 block for lookahead: the START block must
-        # precede the transient so that SHORT blocks capture the actual attack.
-        # Without this, the kick itself gets a LONG MDCT (START) and the post-kick
-        # bass content lands in SHORT blocks with terrible low-frequency resolution.
-        transient_map = {max(x - 1, 0): 0 for x in transient_map}
-        if verbose:
-            print(f"TransientDetection complete: found transients in {len(transient_map)} blocks")
+        env_shift = os.getenv("RMC_TRANSIENT_SHIFT_BLOCKS")
+        if transientShiftBlocks is None and env_shift is not None:
+            transientShiftBlocks = int(env_shift)
+
+        if transientShiftBlocks is None:
+            # Dynamic per-transient placement:
+            # p = onset sample offset in detected block (0..1023 for long blocks).
+            # SHORT(-1) captures earlier onsets; SHORT(0) captures later onsets.
+            # Use overlap geometry to choose the block that best centers the attack.
+            events = detectTransients(
+                inFilename,
+                verbose=False,
+                return_events=True,
+                forceBlockSize=nMDCTLines,
+            )
+            transient_map = {}
+            n_shift_m1 = 0
+            n_shift_0 = 0
+            for event in events:
+                block = int(event["block"])
+                p = int(event["sample_offset"])
+                if p < 448:
+                    shift = -1
+                elif p > 576:
+                    shift = 0
+                else:
+                    shift = -1 if p < 512 else 0
+                shifted_block = max(block + shift, 0)
+                k_attack = min(p // (nMDCTLines // 8), 7)
+                transient_map[shifted_block] = k_attack
+                if shift == -1:
+                    n_shift_m1 += 1
+                else:
+                    n_shift_0 += 1
+            if verbose:
+                print(
+                    f"TransientDetection complete: found transients in {len(transient_map)} blocks "
+                    f"(dynamic shift: -1={n_shift_m1}, 0={n_shift_0})"
+                )
+        else:
+            transient_map = detectTransients(
+                inFilename,
+                verbose=False,
+                forceBlockSize=nMDCTLines,
+            )
+            # Fixed whole-block shift for lookahead experiments and backward compatibility.
+            transient_map = {max(int(x) + transientShiftBlocks, 0): 0 for x in transient_map}
+            if verbose:
+                print(
+                    f"TransientDetection complete: found transients in {len(transient_map)} blocks "
+                    f"(shift={transientShiftBlocks:+d})"
+                )
     else:
         transient_map = {}
         if verbose:

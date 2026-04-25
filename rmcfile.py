@@ -13,10 +13,12 @@ from bitpack import *  # class for packing data into an array of bytes where eac
 import codec    # module where the actual PAC coding functions reside(this module only specifies the PAC file format)
 from psychoac import ScaleFactorBands, AssignMDCTLinesFromFreqLimits  # defines the grouping of MDCT lines into scale factor bands
 from entropy import BlockEntropyCoder, RawMantissaCoder
-from features import ENTROPY_CODING, VARIABLE_BIT_RATE, MID_SIDE_CODING, PREDICTION
-from blockswitching import LONG, SHORT, N_SHORT_BLOCKS, ShortBlockSFBands, WindowForBlockType, SelectBlockType, mask_to_group_lens
+from features import ENTROPY_CODING, VARIABLE_BIT_RATE, MID_SIDE_CODING, PREDICTION, SUBBASS_HYBRID, TNS, AC2A_BLOCK_SWITCHING, ADAPTIVE_CASCADE
+from blockswitching import LONG, START, SHORT, STOP, MEDIUM, N_SHORT_BLOCKS, ShortBlockSFBands, TransitionSFBands, WindowForBlockType, SelectBlockType, mask_to_group_lens, plan_cascade, DesignSFBands
 from mdct import MDCT, IMDCT
 from search import get_best_region, PRED_MAP, GAIN_TABLE, pred_type_to_samples, update_search_buffer
+from tns import TNS_COEFF_BITS, coeff_to_bits, bits_to_coeff
+import subbass
 
 import numpy as np  # to allow conversion of data blocks to numpy's array object
 MAX16BITS = 32767
@@ -58,8 +60,15 @@ class RMCFile(AudioFile):
         #short block switching additions
         myParams.nMDCTLines_short = nMDCTLines // 8
         myParams.sfBands_short = ShortBlockSFBands(myParams.nMDCTLines_short, sampleRate)
+        if AC2A_BLOCK_SWITCHING:
+            _nMDCTLines_trans = (nMDCTLines + nMDCTLines // 8) // 2
+            myParams.nMDCTLines_trans = _nMDCTLines_trans
+            myParams.sfBands_trans = TransitionSFBands(_nMDCTLines_trans, sampleRate)
         myParams.prevBlockType = LONG
         myParams.blockType = LONG
+        myParams.block_queue = []        # cascade: queued MEDIUM block dims
+        myParams.cascade_a = nMDCTLines  # current block left overlap
+        myParams.cascade_b = nMDCTLines  # current block right overlap
         # add in scale factor band information
         myParams.sfBands =sfBands
 
@@ -73,6 +82,7 @@ class RMCFile(AudioFile):
             for _ in range(myParams.nChannels)
         ]
         myParams.prev_use_ms = False  # tracks M/S mode of previous block for OLA transition
+        myParams.k_attack_for_stop = 0  # k_attack from most recent START block; used for AC-2A SHORT pad and STOP window
 
         # entropy coders
         myParams.entropyCoder_long = BlockEntropyCoder(14) if ENTROPY_CODING else RawMantissaCoder()
@@ -118,7 +128,46 @@ class RMCFile(AudioFile):
             if pb.nBytes < nBytes:
                 raise "Only read a partial block of coded PACFile data"
 
-            codingParams.blockType = pb.ReadBits(2)
+            codingParams.blockType = pb.ReadBits(3)
+            if AC2A_BLOCK_SWITCHING and codingParams.blockType == START:
+                k_attack_read = pb.ReadBits(3)
+                codingParams.k_attack_for_stop = k_attack_read
+                if ADAPTIVE_CASCADE:
+                    L, b_start, medium_lead, medium_tail, stop_a = plan_cascade(k_attack_read)
+                else:
+                    b_start = codingParams.nMDCTLines_short
+                    medium_lead, medium_tail, stop_a = [], [(codingParams.nMDCTLines_short, 256), (256, 512)], 512
+                codingParams.cascade_a = halfN
+                codingParams.cascade_b = b_start
+                codingParams.cascade_stop_a = stop_a
+                # Queue: lead MEDIUMs first, then tail MEDIUMs after SHORT (SHORT not in queue)
+                codingParams.block_queue = (
+                    [{'type': MEDIUM, 'a': ma, 'b': mb} for (ma, mb) in medium_lead] +
+                    [{'type': MEDIUM, 'a': ta, 'b': tb} for (ta, tb) in medium_tail]
+                )
+            elif AC2A_BLOCK_SWITCHING and codingParams.blockType == MEDIUM:
+                # Pop cascade dims from queue only on first channel (shared state)
+                if iCh == 0 and getattr(codingParams, 'block_queue', []):
+                    qitem = codingParams.block_queue.pop(0)
+                    codingParams.cascade_a = qitem['a']
+                    codingParams.cascade_b = qitem['b']
+                elif iCh > 0:
+                    pass  # cascade_a/b already set from iCh==0 pop
+                else:
+                    # Fallback: infer from OAA tail
+                    codingParams.cascade_a = len(codingParams.overlapAndAdd[iCh])
+                    codingParams.cascade_b = codingParams.nMDCTLines_short
+            if AC2A_BLOCK_SWITCHING and codingParams.blockType == STOP:
+                # cascade_stop_a was stored when START was read; use it for variable-left STOP
+                codingParams.cascade_a = getattr(codingParams, 'cascade_stop_a',
+                                                 codingParams.nMDCTLines_short)
+                codingParams.cascade_b = halfN
+            if SUBBASS_HYBRID and codingParams.blockType == LONG:
+                has_subbass = bool(pb.ReadBits(1))
+            elif SUBBASS_HYBRID:
+                has_subbass = True  # non-LONG blocks always carry subbass side channel
+            else:
+                has_subbass = False
             pred_type = pb.ReadBits(2)
             # M/S flag: stored only in channel 0 for stereo files
             if iCh == 0 and codingParams.nChannels == 2:
@@ -137,13 +186,47 @@ class RMCFile(AudioFile):
                     pred_enable_flags = [bool(pb.ReadBits(1))
                                          for _ in range(codingParams.sfBands.nBands)]
 
-            if codingParams.blockType == SHORT:
+            if AC2A_BLOCK_SWITCHING and codingParams.blockType == SHORT:
+                # AC-2A single SHORT: no grouping mask
+                overallScaleFactor = pb.ReadBits(codingParams.nScaleBits)
+                scaleFactor = []
+                bitAlloc = []
+                tns_info = None
+                for _ in range(sfBands_short.nBands):
+                    ba = pb.ReadBits(codingParams.nMantSizeBits)
+                    if ba: ba += 1
+                    bitAlloc.append(ba)
+                    scaleFactor.append(pb.ReadBits(codingParams.nScaleBits))
+                mantissa = codingParams.entropyCoder_short.decode_block(
+                    pb, bitAlloc, sfBands_short, codingParams.nMDCTLines_short
+                )
+            elif AC2A_BLOCK_SWITCHING and codingParams.blockType == MEDIUM:
+                # Cascade intermediate block
+                ca = codingParams.cascade_a
+                cb = codingParams.cascade_b
+                halfN_med = (ca + cb) // 2
+                sfBands_med = DesignSFBands(halfN_med, codingParams.sampleRate)
+                overallScaleFactor = pb.ReadBits(codingParams.nScaleBits)
+                scaleFactor = []
+                bitAlloc = []
+                tns_info = None
+                for _ in range(sfBands_med.nBands):
+                    ba = pb.ReadBits(codingParams.nMantSizeBits)
+                    if ba: ba += 1
+                    bitAlloc.append(ba)
+                    scaleFactor.append(pb.ReadBits(codingParams.nScaleBits))
+                mantissa = codingParams.entropyCoder_long.decode_block(
+                    pb, bitAlloc, sfBands_med, halfN_med
+                )
+            elif codingParams.blockType == SHORT:
+                # Edler SHORT: grouping mask + groups
                 grouping_mask = pb.ReadBits(7)
                 group_lens = mask_to_group_lens(grouping_mask)
                 overallScaleFactor = []
                 scaleFactor = []
                 bitAlloc = []
                 mantissa = []
+                tns_info = []
                 for G in group_lens:
                     # Read shared ba/sf once for this group
                     shared_ba = []
@@ -162,17 +245,37 @@ class RMCFile(AudioFile):
                         scaleFactor.append(shared_sf)
                         bitAlloc.append(shared_ba)
                         mantissa.append(mant_i)
+                if TNS:
+                    for _ in range(N_SHORT_BLOCKS):
+                        enabled = bool(pb.ReadBits(1))
+                        coeff_q = bits_to_coeff(pb.ReadBits(TNS_COEFF_BITS)) if enabled else 0
+                        tns_info.append({"enabled": enabled, "coeff_q": coeff_q})
+                else:
+                    tns_info = None
             else:
+                # LONG and START/STOP (AC-2A or Edler)
                 overallScaleFactor = pb.ReadBits(codingParams.nScaleBits)
                 scaleFactor = []
                 bitAlloc = []
-                for _ in range(codingParams.sfBands.nBands):
+                tns_info = None
+                if AC2A_BLOCK_SWITCHING and codingParams.blockType in (START, STOP):
+                    ca = getattr(codingParams, 'cascade_a', halfN)
+                    cb = getattr(codingParams, 'cascade_b', codingParams.nMDCTLines_short)
+                    _halfN_dec = (ca + cb) // 2
+                    if _halfN_dec != codingParams.nMDCTLines_trans:
+                        _sfb_dec = DesignSFBands(_halfN_dec, codingParams.sampleRate)
+                    else:
+                        _sfb_dec = codingParams.sfBands_trans
+                else:
+                    _sfb_dec = codingParams.sfBands
+                    _halfN_dec = codingParams.nMDCTLines
+                for _ in range(_sfb_dec.nBands):
                     ba = pb.ReadBits(codingParams.nMantSizeBits)
                     if ba: ba += 1
                     bitAlloc.append(ba)
                     scaleFactor.append(pb.ReadBits(codingParams.nScaleBits))
                 mantissa = codingParams.entropyCoder_long.decode_block(
-                    pb, bitAlloc, codingParams.sfBands, codingParams.nMDCTLines
+                    pb, bitAlloc, _sfb_dec, _halfN_dec
                 )
 
             # Compute prediction signal from the search buffer.
@@ -189,7 +292,8 @@ class RMCFile(AudioFile):
                 seg_start = len(buf) - start_offset + pred_offset
                 if 0 <= seg_start and seg_start + N <= len(buf):
                     candidate = buf[seg_start : seg_start + N]
-                    window = WindowForBlockType(codingParams.blockType, N, N_short)
+                    _k = (codingParams.k_attack_for_stop if AC2A_BLOCK_SWITCHING else None)
+                    window = WindowForBlockType(codingParams.blockType, N, N_short, k_attack=_k)
                     mdct_P_raw = MDCT(window * candidate, halfN, halfN)[:halfN]
                     enable_mask = np.zeros(halfN)
                     if pred_enable_flags is not None:
@@ -201,7 +305,22 @@ class RMCFile(AudioFile):
                     mdct_P = pred_alpha_q * mdct_P_raw * enable_mask
 
             decodedData = self.Decode(scaleFactor, bitAlloc, mantissa, overallScaleFactor,
-                                      codingParams, mdct_pred=mdct_P)
+                                      codingParams, mdct_pred=mdct_P, tns_info=tns_info)
+
+            # Sub-bass hybrid: read K low-band bins and add LONG IMDCT reconstruction
+            if has_subbass:
+                from quantize import vDequantize as _vDQ2
+                ovs  = pb.ReadBits(codingParams.nScaleBits)
+                sf   = pb.ReadBits(codingParams.nScaleBits)
+                mant_low = np.array([pb.ReadBits(subbass.LOW_MANT_BITS)
+                                     for _ in range(subbass.K_BINS)], dtype=np.int32)
+                low_bins = _vDQ2(sf, mant_low, codingParams.nScaleBits, subbass.LOW_MANT_BITS)
+                low_bins /= (1 << ovs)
+                low_padded = np.zeros(halfN)
+                low_padded[:subbass.K_BINS] = low_bins
+                data_low = WindowForBlockType(LONG, N, N_short) * IMDCT(low_padded, halfN, halfN)
+                decodedData = decodedData + data_low
+
             raw_decoded.append(decodedData)
 
         # M/S↔L/R domain transition: if previous block used a different stereo mode,
@@ -219,14 +338,16 @@ class RMCFile(AudioFile):
         codingParams.prev_use_ms = use_ms
 
         # Overlap-and-add in current block's domain (M/S or L/R)
+        # ola_size is self-sizing: LONG/STOP leave 1024-sample tail; START/SHORT leave 128-sample tail
         data_current_domain = []
         for iCh in range(codingParams.nChannels):
             decodedData = raw_decoded[iCh]
+            ola_size = len(codingParams.overlapAndAdd[iCh])
             out = np.maximum(-1., np.minimum(1.,
-                np.add(codingParams.overlapAndAdd[iCh], decodedData[:halfN])
+                np.add(codingParams.overlapAndAdd[iCh], decodedData[:ola_size])
             ))
             data_current_domain.append(out)
-            codingParams.overlapAndAdd[iCh] = decodedData[halfN:]
+            codingParams.overlapAndAdd[iCh] = decodedData[ola_size:]
 
         # Convert M/S output to L/R
         if use_ms and codingParams.nChannels == 2:
@@ -241,8 +362,17 @@ class RMCFile(AudioFile):
             lr_for_buffer = [M_full + S_full, M_full - S_full]
         else:
             lr_for_buffer = raw_decoded
+        if AC2A_BLOCK_SWITCHING and codingParams.blockType == SHORT:
+            _halfN_buf = codingParams.nMDCTLines_short
+        elif AC2A_BLOCK_SWITCHING and codingParams.blockType in (START, STOP, MEDIUM):
+            ca = getattr(codingParams, 'cascade_a', halfN)
+            cb = getattr(codingParams, 'cascade_b', codingParams.nMDCTLines_short)
+            _halfN_buf = (ca + cb) // 2
+        else:
+            _halfN_buf = halfN
+        _N_buf = 2 * _halfN_buf
         for iCh in range(codingParams.nChannels):
-            update_search_buffer(codingParams.search_buffer[iCh], lr_for_buffer[iCh], halfN, N)
+            update_search_buffer(codingParams.search_buffer[iCh], lr_for_buffer[iCh], _halfN_buf, _N_buf)
 
         return data
 
@@ -274,7 +404,28 @@ class RMCFile(AudioFile):
         #short block switching additions
         codingParams.nMDCTLines_short = codingParams.nMDCTLines // 8
         codingParams.sfBands_short = ShortBlockSFBands(codingParams.nMDCTLines_short, codingParams.sampleRate)
+        if AC2A_BLOCK_SWITCHING:
+            _nMDCTLines_trans = (codingParams.nMDCTLines + codingParams.nMDCTLines_short) // 2
+            codingParams.nMDCTLines_trans = _nMDCTLines_trans
+            codingParams.sfBands_trans = TransitionSFBands(_nMDCTLines_trans, codingParams.sampleRate)
+            codingParams.currentSamplePos = 0
+            codingParams.short_blocks_remaining = 0
+            # Pre-set nSamplesPerBlock for the first PCM read
+            _tb = getattr(codingParams, 'transientBlocks', {})
+            _k0 = _tb.get(0, -1)
+            if _k0 >= 0:
+                if ADAPTIVE_CASCADE:
+                    from blockswitching import plan_cascade as _pc
+                    _, _bs0, _, _, _ = _pc(_k0)
+                    codingParams.nSamplesPerBlock = _bs0
+                else:
+                    codingParams.nSamplesPerBlock = codingParams.nMDCTLines_short
         codingParams.blockType = LONG
+        codingParams.block_queue = []
+        codingParams.cascade_a = codingParams.nMDCTLines
+        codingParams.cascade_b = codingParams.nMDCTLines
+        codingParams.cascade_tail = []
+        codingParams.cascade_stop_a = codingParams.nMDCTLines_short
         codingParams.entropyCoder_long = BlockEntropyCoder(14) if ENTROPY_CODING else RawMantissaCoder()
         codingParams.entropyCoder_short = BlockEntropyCoder(14) if ENTROPY_CODING else RawMantissaCoder()
 
@@ -295,6 +446,7 @@ class RMCFile(AudioFile):
         codingParams.priorBlock = priorBlock
         #initialize prevBlockType
         codingParams.prevBlockType = LONG
+        codingParams.k_attack_for_stop = 0
         # prediction stats
         codingParams._stat_total_blocks = 0
         codingParams._stat_pred_blocks = 0
@@ -309,6 +461,10 @@ class RMCFile(AudioFile):
         codingParams.masking_signals = None
         codingParams.mdct_pred_corrections = None
         codingParams.block_overhead = None
+        # Sub-bass hybrid: per-channel LPF state and delay buffer (kept warm across all blocks)
+        if SUBBASS_HYBRID:
+            codingParams.lpf_state     = [subbass.make_state()     for _ in range(codingParams.nChannels)]
+            codingParams.lpf_delay_buf = [subbass.make_delay_buf() for _ in range(codingParams.nChannels)]
         return
 
 
@@ -317,16 +473,102 @@ class RMCFile(AudioFile):
         Writes a block of signed-fraction data to a PACFile object that has
         already executed OpenForWriting()"""
 
-        # Concatenate previous and current half-blocks to form full MDCT input windows (L/R domain)
-        fullBlockData_ = []
-        for iCh in range(codingParams.nChannels):
-            fullBlockData_.append(np.concatenate((codingParams.priorBlock[iCh], data[iCh])))
-        codingParams.priorBlock = data
-
         sfBands_short = codingParams.sfBands_short
         halfN = codingParams.nMDCTLines
         N = 2 * halfN
-        N_short = 2 * codingParams.nMDCTLines_short
+        halfN_short = codingParams.nMDCTLines_short
+        N_short = 2 * halfN_short
+        N_trans = halfN + halfN_short  # 1152 for AC-2A transitions
+
+        # AC-2A: determine block type and cascade dimensions before building analysis windows
+        if AC2A_BLOCK_SWITCHING:
+            block_1024_idx = codingParams.currentSamplePos // halfN
+            k_attack = codingParams.transientBlocks.get(block_1024_idx, -1)
+            _prev = codingParams.prevBlockType
+            _rem  = codingParams.short_blocks_remaining
+
+            if codingParams.block_queue:
+                # Pop next planned MEDIUM block from cascade queue
+                qitem = codingParams.block_queue.pop(0)
+                _bt = qitem['type']
+                codingParams.cascade_a = qitem['a']
+                codingParams.cascade_b = qitem['b']
+            elif _prev in (LONG, STOP):
+                if k_attack >= 0:
+                    _bt = START
+                    if ADAPTIVE_CASCADE:
+                        L, b_start, medium_lead, medium_tail, stop_a = plan_cascade(k_attack)
+                        codingParams.cascade_a = halfN
+                        codingParams.cascade_b = b_start
+                        for (ma, mb) in medium_lead:
+                            codingParams.block_queue.append(
+                                {'type': MEDIUM, 'a': ma, 'b': mb}
+                            )
+                    else:
+                        b_start = halfN_short
+                        medium_tail, stop_a = [(halfN_short, 256), (256, 512)], 512
+                        codingParams.cascade_a = halfN
+                        codingParams.cascade_b = halfN_short
+                    codingParams.short_blocks_remaining = 1
+                    codingParams.cascade_tail = medium_tail
+                    codingParams.cascade_stop_a = stop_a
+                    codingParams.k_attack_for_stop = max(0, k_attack)
+                else:
+                    _bt = LONG
+                    codingParams.cascade_a = halfN
+                    codingParams.cascade_b = halfN
+            elif _prev in (START, MEDIUM):
+                _bt = SHORT
+                codingParams.cascade_a = halfN_short
+                codingParams.cascade_b = halfN_short
+            elif _prev == SHORT:
+                _bt = SHORT if _rem > 0 else STOP
+                if _bt == STOP:
+                    codingParams.cascade_a = halfN_short
+                    codingParams.cascade_b = halfN
+                else:
+                    codingParams.cascade_a = halfN_short
+                    codingParams.cascade_b = halfN_short
+            else:  # STOP → LONG
+                _bt = LONG
+                codingParams.cascade_a = halfN
+                codingParams.cascade_b = halfN
+
+            codingParams.blockType = _bt
+            codingParams.prevBlockType = _bt
+            if _bt == SHORT:
+                codingParams.short_blocks_remaining -= 1
+                if codingParams.short_blocks_remaining == 0:
+                    for (ta, tb) in codingParams.cascade_tail:
+                        codingParams.block_queue.append({'type': MEDIUM, 'a': ta, 'b': tb})
+                    codingParams.block_queue.append(
+                        {'type': STOP, 'a': codingParams.cascade_stop_a, 'b': halfN}
+                    )
+            codingParams.group_lens = None
+            codingParams.grouping_mask = 0
+
+        # Build full analysis windows per channel (rolling 1024-sample priorBlock for AC-2A)
+        fullBlockData_ = []
+        maskingData_ = []
+        new_prior = []
+        for iCh in range(codingParams.nChannels):
+            all_samples = np.concatenate((codingParams.priorBlock[iCh], data[iCh]))
+            new_prior.append(all_samples[-halfN:])  # rolling 1024-sample prior
+            if AC2A_BLOCK_SWITCHING:
+                _bt = codingParams.blockType
+                if _bt == LONG:
+                    fullBlockData_.append(all_samples)
+                    maskingData_.append(all_samples)
+                else:
+                    # MDCT uses truncated window; masking uses full all_samples for
+                    # better FFT resolution (1152 samples → 38 Hz/bin vs 172 Hz/bin for SHORT)
+                    N_block = codingParams.cascade_a + codingParams.cascade_b
+                    fullBlockData_.append(all_samples[-N_block:])
+                    maskingData_.append(all_samples)
+            else:
+                fullBlockData_.append(all_samples)                # always 2048 for Edler
+                maskingData_.append(all_samples)
+        codingParams.priorBlock = new_prior
 
         # Block-level M/S stereo decision: use M/S if side energy < min(L energy, R energy)
         use_ms = False
@@ -338,22 +580,58 @@ class RMCFile(AudioFile):
                 use_ms = True
                 fullBlockData_ = [M, S]
 
-        # Block type state machine: LONG → START → SHORT → STOP → LONG
-        # Driven by pre-computed transient map (k_attack >= 0 triggers transition to SHORT)
-        k_attack = codingParams.transientBlocks.get(codingParams.blockIndex, -1)
-        codingParams.blockType = SelectBlockType(k_attack, codingParams.prevBlockType)
-        codingParams.prevBlockType = codingParams.blockType
-        codingParams.blockIndex += 1
-        if codingParams.blockType == SHORT:
-            # All 8 sub-blocks in one group: minimizes sf/ba overhead and lets the
-            # 2x bit budget go to mantissas. Without exact sub-window transient
-            # localization, isolating a specific window is a blind guess anyway.
-            codingParams.group_lens = [N_SHORT_BLOCKS]
-            codingParams.grouping_mask = 0
-        else:
-            codingParams.group_lens = None
-            codingParams.grouping_mask = 0
+        # Block type state machine (Edler / non-AC-2A path only)
+        prev_block_type_for_adj = codingParams.prevBlockType
+        if not AC2A_BLOCK_SWITCHING:
+            k_attack = codingParams.transientBlocks.get(codingParams.blockIndex, -1)
+            codingParams.blockType = SelectBlockType(k_attack, codingParams.prevBlockType)
+            codingParams.prevBlockType = codingParams.blockType
+            codingParams.blockIndex += 1
+            if codingParams.blockType == SHORT:
+                grouping_mask = (1 << (N_SHORT_BLOCKS - 1)) - 1  # 0b1111111 = all singletons
+                codingParams.group_lens = mask_to_group_lens(grouping_mask)
+                codingParams.grouping_mask = grouping_mask
+            else:
+                codingParams.group_lens = None
+                codingParams.grouping_mask = 0
         current_block_type = codingParams.blockType
+
+        # Adjacent LONG blocks (immediately before START or immediately after STOP) must encode
+        # y_high + K_BINS side channel, same as transient blocks, so the MDCT overlap region
+        # sees the same signal on both sides of the LONG↔START and STOP↔LONG boundaries (TDAC fix).
+        is_adjacent_long = False
+        if SUBBASS_HYBRID and current_block_type == LONG:
+            is_adjacent_long = (
+                prev_block_type_for_adj == STOP or            # post-STOP LONG
+                codingParams.blockIndex in codingParams.transientBlocks  # pre-START LONG (blockIndex already incremented)
+            )
+
+        # Sub-bass hybrid split: run LPF every block to keep state warm.
+        # Transient blocks + adjacent LONG: split into y_low (K bins) and y_high (encoding path).
+        # Non-adjacent LONG blocks: encode x_delayed.
+        lpf_low_k_bins = {}  # iCh -> K low MDCT bins (transient + adjacent LONG blocks)
+        lpf_y_high     = {}  # iCh -> y_high 2048-sample residual (transient + adjacent LONG blocks)
+        if SUBBASS_HYBRID:
+            for iCh in range(codingParams.nChannels):
+                x = fullBlockData_[iCh]
+                if current_block_type != LONG or is_adjacent_long:
+                    y_low, y_high, new_state, new_delay = subbass.compute_split(
+                        x, codingParams.lpf_state[iCh], codingParams.lpf_delay_buf[iCh],
+                        codingParams.sampleRate
+                    )
+                    w_long = WindowForBlockType(LONG, N, N_short)
+                    low_mdct = MDCT(w_long * y_low, halfN, halfN)[:halfN]
+                    lpf_low_k_bins[iCh] = low_mdct[:subbass.K_BINS]
+                    lpf_y_high[iCh]     = y_high
+                    # fullBlockData_ stays as x (used for masking); y_high used via lpf_y_high
+                else:
+                    new_state, new_delay, x_delayed = subbass.update_state_only(
+                        x, codingParams.lpf_state[iCh], codingParams.lpf_delay_buf[iCh],
+                        codingParams.sampleRate
+                    )
+                    fullBlockData_[iCh] = x_delayed
+                codingParams.lpf_state[iCh]     = new_state
+                codingParams.lpf_delay_buf[iCh] = new_delay
 
         # Compute M/S search buffers on-the-fly from L/R buffers (search buffers always hold L/R)
         if use_ms and codingParams.nChannels == 2:
@@ -379,11 +657,19 @@ class RMCFile(AudioFile):
         enable_masks = []
         corrections = []
         for iCh in range(codingParams.nChannels):
-            if PREDICTION and current_block_type != SHORT:
-                window = WindowForBlockType(current_block_type, N, N_short)
-                mdct_X = MDCT(window * fullBlockData_[iCh], halfN, halfN)[:halfN]
+            # For SUBBASS_HYBRID transient blocks, prediction runs on y_high (the Edler signal).
+            # Per-band enable naturally skips low bands where y_high ≈ 0, so the template
+            # subtraction only applies where it helps (mid/high frequencies).
+            pred_signal = (lpf_y_high[iCh]
+                           if SUBBASS_HYBRID and (current_block_type != LONG or is_adjacent_long) and iCh in lpf_y_high
+                           else fullBlockData_[iCh])
+            run_prediction = PREDICTION and current_block_type != SHORT
+            if run_prediction:
+                _k = (codingParams.k_attack_for_stop if AC2A_BLOCK_SWITCHING else None)
+                window = WindowForBlockType(current_block_type, N, N_short, k_attack=_k)
+                mdct_X = MDCT(window * pred_signal, halfN, halfN)[:halfN]
                 range_type, pcm_residual, rel_offset, mdct_P, alpha_idx, alpha_q = get_best_region(
-                    mdct_X, fullBlockData_[iCh], codingParams,
+                    mdct_X, pred_signal, codingParams,
                     search_bufs[iCh], block_type=current_block_type
                 )
                 if range_type is not None:
@@ -399,7 +685,7 @@ class RMCFile(AudioFile):
                             enable_m[lo:hi] = 1.0
                     if not np.any(enable_f):
                         range_type, pcm_residual, rel_offset, mdct_P, alpha_idx, alpha_q = \
-                            None, fullBlockData_[iCh], 0, None, 0, 1.0
+                            None, pred_signal, 0, None, 0, 1.0
                         enable_f = np.zeros(codingParams.sfBands.nBands, dtype=bool)
                         enable_m = np.zeros(halfN)
                         correction = None
@@ -411,9 +697,9 @@ class RMCFile(AudioFile):
                     enable_f = np.zeros(codingParams.sfBands.nBands, dtype=bool)
                     enable_m = np.zeros(halfN)
                     correction = None
-            else:  # SHORT block (transients not repetitive) or PREDICTION disabled
+            else:  # SHORT or PREDICTION disabled
                 range_type, pcm_residual, rel_offset, mdct_P, alpha_idx, alpha_q = \
-                    None, fullBlockData_[iCh], 0, None, 0, 1.0
+                    None, pred_signal, 0, None, 0, 1.0
                 enable_f = np.array([], dtype=bool)
                 enable_m = np.zeros(halfN)
                 correction = None
@@ -442,7 +728,9 @@ class RMCFile(AudioFile):
         # Compute per-channel bitstream overhead not accounted for in base bit budget
         block_overhead = []
         for iCh in range(codingParams.nChannels):
-            oh = 32 + 2 + 2  # nBytes field (4 bytes) + block type + pred type
+            oh = 32 + 3 + 2  # nBytes field (4 bytes) + 3-bit block type + pred type
+            if AC2A_BLOCK_SWITCHING and current_block_type == START:
+                oh += 3  # k_attack field
             if iCh == 0 and codingParams.nChannels == 2:
                 oh += 1  # M/S flag
             if ranges[iCh] is not None:
@@ -450,23 +738,70 @@ class RMCFile(AudioFile):
                 if current_block_type != SHORT:
                     oh += codingParams.sfBands.nBands  # per-band enable flags
             if current_block_type == SHORT:
-                oh += 7  # grouping mask
+                if not AC2A_BLOCK_SWITCHING:
+                    oh += 7  # grouping mask (Edler only)
+                if TNS and not AC2A_BLOCK_SWITCHING:
+                    # Reserve worst-case TNS side info for budgeting: flag + coeff per sub-block.
+                    oh += N_SHORT_BLOCKS * (1 + TNS_COEFF_BITS)
+            if SUBBASS_HYBRID:
+                if current_block_type == LONG:
+                    oh += 1  # has_subbass flag bit
+                    if is_adjacent_long:
+                        oh += codingParams.nScaleBits * 2 + subbass.K_BINS * subbass.LOW_MANT_BITS
+                else:
+                    oh += codingParams.nScaleBits * 2 + subbass.K_BINS * subbass.LOW_MANT_BITS
             block_overhead.append(oh)
 
         # Encode the residual signals with original signal for psychoacoustic masking
-        codingParams.masking_signals = fullBlockData_
+        codingParams.masking_signals = maskingData_
         codingParams.mdct_pred_corrections = corrections
         codingParams.block_overhead = block_overhead
         (scaleFactor, bitAlloc, mantissa, overallScaleFactor) = self.Encode(fullBlockData, codingParams)
+        tns_short_info = getattr(codingParams, "_tns_short_info", None)
         codingParams.masking_signals = None
         codingParams.mdct_pred_corrections = None
 
         # Encoder-side decode: reconstruct lossy output and store in search buffer so that
         # future prediction searches see the same signal the decoder will have.
-        halfN_short = codingParams.nMDCTLines_short
+        halfN_trans = getattr(codingParams, 'nMDCTLines_trans', (halfN + halfN_short) // 2)
         decoded_channels = []
         for iCh in range(codingParams.nChannels):
-            if current_block_type != SHORT:
+            if AC2A_BLOCK_SWITCHING and current_block_type == SHORT:
+                mantissa_full = codec.ExpandMantissa(
+                    mantissa[iCh], bitAlloc[iCh], sfBands_short, halfN_short
+                )
+                decodedData = codec.Decode(
+                    scaleFactor[iCh], bitAlloc[iCh], mantissa_full,
+                    overallScaleFactor[iCh], codingParams
+                )
+            elif AC2A_BLOCK_SWITCHING and current_block_type == MEDIUM:
+                ca = codingParams.cascade_a
+                cb = codingParams.cascade_b
+                halfN_med = (ca + cb) // 2
+                sfBands_med = DesignSFBands(halfN_med, codingParams.sampleRate)
+                mantissa_full = codec.ExpandMantissa(
+                    mantissa[iCh], bitAlloc[iCh], sfBands_med, halfN_med
+                )
+                decodedData = codec.Decode(
+                    scaleFactor[iCh], bitAlloc[iCh], mantissa_full,
+                    overallScaleFactor[iCh], codingParams
+                )
+            elif AC2A_BLOCK_SWITCHING and current_block_type in (START, STOP):
+                ca = codingParams.cascade_a
+                cb = codingParams.cascade_b
+                halfN_used = (ca + cb) // 2
+                sfBands_used = DesignSFBands(halfN_used, codingParams.sampleRate) \
+                    if halfN_used != halfN_trans else codingParams.sfBands_trans
+                mantissa_full = codec.ExpandMantissa(
+                    mantissa[iCh], bitAlloc[iCh], sfBands_used, halfN_used
+                )
+                scaled_pred = (alpha_qs[iCh] * pred_mdcts[iCh] * enable_masks[iCh]
+                               if pred_mdcts[iCh] is not None else None)
+                decodedData = codec.Decode(
+                    scaleFactor[iCh], bitAlloc[iCh], mantissa_full,
+                    overallScaleFactor[iCh], codingParams, mdct_pred=scaled_pred
+                )
+            elif current_block_type != SHORT:
                 mantissa_full = codec.ExpandMantissa(
                     mantissa[iCh], bitAlloc[iCh], codingParams.sfBands, halfN
                 )
@@ -476,13 +811,31 @@ class RMCFile(AudioFile):
                     scaleFactor[iCh], bitAlloc[iCh], mantissa_full,
                     overallScaleFactor[iCh], codingParams, mdct_pred=scaled_pred
                 )
-            else:  # SHORT block (START/STOP use the LONG path above)
+            else:  # Edler SHORT
                 full_mant = [codec.ExpandMantissa(mantissa[iCh][i], bitAlloc[iCh][i], sfBands_short, halfN_short)
                              for i in range(N_SHORT_BLOCKS)]
                 decodedData = codec.Decode(
                     scaleFactor[iCh], bitAlloc[iCh], full_mant,
-                    overallScaleFactor[iCh], codingParams
+                    overallScaleFactor[iCh], codingParams,
+                    tns_info=tns_short_info[iCh] if tns_short_info is not None else None
                 )
+            # Sub-bass hybrid: add quantized y_low LONG IMDCT so search buffer matches decoder.
+            # Every non-LONG block + adjacent LONG: decoder outputs y_high + y_low; buffer must match.
+            if SUBBASS_HYBRID and (current_block_type != LONG or is_adjacent_long) and iCh in lpf_low_k_bins:
+                from quantize import ScaleFactor as _SF, vMantissa as _vM, vDequantize as _vDQ
+                low_bins = lpf_low_k_bins[iCh]
+                max_abs  = np.max(np.abs(low_bins)) if np.any(low_bins != 0) else 1e-10
+                ovs = _SF(max_abs, codingParams.nScaleBits)
+                scaled = low_bins * (1 << ovs)
+                max_sc = np.max(np.abs(scaled)) if np.any(scaled != 0) else 1e-10
+                sf  = _SF(max_sc, codingParams.nScaleBits, subbass.LOW_MANT_BITS)
+                mant_q = _vM(scaled, sf, codingParams.nScaleBits, subbass.LOW_MANT_BITS)
+                low_bins_q = _vDQ(sf, mant_q, codingParams.nScaleBits, subbass.LOW_MANT_BITS)
+                low_bins_q /= (1 << ovs)
+                low_padded = np.zeros(halfN)
+                low_padded[:subbass.K_BINS] = low_bins_q
+                data_low = WindowForBlockType(LONG, N, N_short) * IMDCT(low_padded, halfN, halfN)
+                decodedData = decodedData + data_low
             decoded_channels.append(decodedData)
 
         # Convert M/S decoded data back to L/R before storing in search buffer
@@ -491,8 +844,15 @@ class RMCFile(AudioFile):
             lr_for_buffer = [M_hat + S_hat, M_hat - S_hat]
         else:
             lr_for_buffer = decoded_channels
+        if AC2A_BLOCK_SWITCHING and current_block_type == SHORT:
+            _halfN_buf = halfN_short
+        elif AC2A_BLOCK_SWITCHING and current_block_type in (START, STOP, MEDIUM):
+            _halfN_buf = (codingParams.cascade_a + codingParams.cascade_b) // 2
+        else:
+            _halfN_buf = halfN
+        _N_buf = 2 * _halfN_buf
         for iCh in range(codingParams.nChannels):
-            update_search_buffer(codingParams.search_buffer[iCh], lr_for_buffer[iCh], halfN, N)
+            update_search_buffer(codingParams.search_buffer[iCh], lr_for_buffer[iCh], _halfN_buf, _N_buf)
 
         # Write bitstream per channel:
         #   [2b block_type | 2b pred_type | 1b ms_flag (ch0 only)]
@@ -501,14 +861,35 @@ class RMCFile(AudioFile):
         #   [nScaleBits ovs | nMantSizeBits+nScaleBits per band | entropy-coded mantissas]
         for iCh in range(codingParams.nChannels):
             entropy_pbs = []
-            nBits = 4  # 2 bits block type + 2 bits prediction type
+            nBits = 5  # 3 bits block type + 2 bits prediction type
+            if AC2A_BLOCK_SWITCHING and codingParams.blockType == START:
+                nBits += 3  # k_attack field
             if iCh == 0 and codingParams.nChannels == 2:
                 nBits += 1  # M/S flag
             if ranges[iCh] is not None:
                 nBits += 9 + 3  # sign+offset + gain
                 if codingParams.blockType != SHORT:
                     nBits += codingParams.sfBands.nBands  # per-band enables for LONG/START/STOP
-            if codingParams.blockType == SHORT:
+            if AC2A_BLOCK_SWITCHING and codingParams.blockType == SHORT:
+                # AC-2A single SHORT: overallScaleFactor + per-band ba/sf + entropy mantissa
+                entropy_pb_short = codingParams.entropyCoder_short.encode_block(
+                    mantissa[iCh], bitAlloc[iCh], sfBands_short
+                )
+                nBits += codingParams.nScaleBits  # overallScaleFactor
+                for iBand in range(sfBands_short.nBands):
+                    nBits += codingParams.nMantSizeBits + codingParams.nScaleBits
+                nBits += entropy_pb_short.nBits
+                if VARIABLE_BIT_RATE:
+                    _raw_short = sum(
+                        bitAlloc[iCh][iBand] * sfBands_short.nLines[iBand]
+                        for iBand in range(sfBands_short.nBands) if bitAlloc[iCh][iBand] > 0
+                    )
+                    if _raw_short > 0:
+                        _r = entropy_pb_short.nBits / _raw_short
+                        codingParams._entropy_ratio_short = 0.9 * codingParams._entropy_ratio_short + 0.1 * _r
+                        codingParams._entropy_inflation_short = min(2.5, max(0.5, 1.0 / codingParams._entropy_ratio_short))
+            elif codingParams.blockType == SHORT:
+                # Edler SHORT: grouping mask + groups
                 group_lens = codingParams.group_lens
                 nBits += 7  # grouping mask
                 sub_idx = 0
@@ -525,6 +906,11 @@ class RMCFile(AudioFile):
                         nBits += codingParams.nScaleBits  # overallScaleFactor
                         nBits += entropy_pb.nBits
                     sub_idx += G
+                if TNS:
+                    for info in tns_short_info[iCh]:
+                        nBits += 1
+                        if info["enabled"]:
+                            nBits += TNS_COEFF_BITS
                 # Update SHORT entropy compression ratio (EMA)
                 if VARIABLE_BIT_RATE:
                     _raw_short = sum(
@@ -538,19 +924,43 @@ class RMCFile(AudioFile):
                         _r = _ent_short / _raw_short
                         codingParams._entropy_ratio_short = 0.9 * codingParams._entropy_ratio_short + 0.1 * _r
                         codingParams._entropy_inflation_short = min(2.5, max(0.5, 1.0 / codingParams._entropy_ratio_short))
-            else:
+            elif AC2A_BLOCK_SWITCHING and codingParams.blockType == MEDIUM:
+                # MEDIUM cascade block: same format as START/STOP (ovs + per-band sf/ba + mantissas)
+                ca = codingParams.cascade_a
+                cb = codingParams.cascade_b
+                halfN_med = (ca + cb) // 2
+                _sfb_med = DesignSFBands(halfN_med, codingParams.sampleRate)
                 entropy_pb = codingParams.entropyCoder_long.encode_block(
-                    mantissa[iCh], bitAlloc[iCh], codingParams.sfBands
+                    mantissa[iCh], bitAlloc[iCh], _sfb_med
                 )
                 nBits += codingParams.nScaleBits
-                for iBand in range(codingParams.sfBands.nBands):
+                for iBand in range(_sfb_med.nBands):
+                    nBits += codingParams.nMantSizeBits + codingParams.nScaleBits
+                nBits += entropy_pb.nBits
+            else:
+                # LONG and START/STOP (AC-2A or Edler)
+                ca = getattr(codingParams, 'cascade_a', halfN)
+                cb = getattr(codingParams, 'cascade_b', halfN)
+                halfN_enc = (ca + cb) // 2
+                _sfb_enc = (
+                    DesignSFBands(halfN_enc, codingParams.sampleRate)
+                    if AC2A_BLOCK_SWITCHING and codingParams.blockType in (START, STOP) and halfN_enc != halfN_trans
+                    else (codingParams.sfBands_trans
+                          if AC2A_BLOCK_SWITCHING and codingParams.blockType in (START, STOP)
+                          else codingParams.sfBands)
+                )
+                entropy_pb = codingParams.entropyCoder_long.encode_block(
+                    mantissa[iCh], bitAlloc[iCh], _sfb_enc
+                )
+                nBits += codingParams.nScaleBits
+                for iBand in range(_sfb_enc.nBands):
                     nBits += codingParams.nMantSizeBits + codingParams.nScaleBits
                 nBits += entropy_pb.nBits
                 # Update LONG entropy compression ratio (EMA)
                 if VARIABLE_BIT_RATE:
                     _raw_long = sum(
-                        bitAlloc[iCh][iBand] * codingParams.sfBands.nLines[iBand]
-                        for iBand in range(codingParams.sfBands.nBands)
+                        bitAlloc[iCh][iBand] * _sfb_enc.nLines[iBand]
+                        for iBand in range(_sfb_enc.nBands)
                         if bitAlloc[iCh][iBand] > 0
                     )
                     if _raw_long > 0:
@@ -558,12 +968,23 @@ class RMCFile(AudioFile):
                         codingParams._entropy_ratio = 0.9 * codingParams._entropy_ratio + 0.1 * _r
                         codingParams._entropy_inflation = min(2.5, max(0.5, 1.0 / codingParams._entropy_ratio))
 
+            if SUBBASS_HYBRID:
+                if codingParams.blockType == LONG:
+                    nBits += 1  # has_subbass flag
+                    if is_adjacent_long:
+                        nBits += codingParams.nScaleBits * 2 + subbass.K_BINS * subbass.LOW_MANT_BITS
+                else:
+                    nBits += codingParams.nScaleBits * 2 + subbass.K_BINS * subbass.LOW_MANT_BITS
             nBytes = (nBits + BYTESIZE - 1) // BYTESIZE
             self.fp.write(pack("<L", int(nBytes)))
 
             pb = PackedBits()
             pb.Size(nBytes)
-            pb.WriteBits(codingParams.blockType, 2)
+            pb.WriteBits(codingParams.blockType, 3)
+            if AC2A_BLOCK_SWITCHING and codingParams.blockType == START:
+                pb.WriteBits(codingParams.k_attack_for_stop, 3)
+            if SUBBASS_HYBRID and codingParams.blockType == LONG:
+                pb.WriteBits(1 if is_adjacent_long else 0, 1)
             pb.WriteBits(PRED_MAP[ranges[iCh]], 2)
             if iCh == 0 and codingParams.nChannels == 2:
                 pb.WriteBits(1 if use_ms else 0, 1)
@@ -576,7 +997,25 @@ class RMCFile(AudioFile):
                     for iBand in range(codingParams.sfBands.nBands):
                         pb.WriteBits(1 if enable_flags_list[iCh][iBand] else 0, 1)
 
-            if codingParams.blockType == SHORT:
+            if AC2A_BLOCK_SWITCHING and codingParams.blockType == SHORT:
+                # AC-2A single SHORT: overallScaleFactor + per-band ba/sf + entropy mantissa
+                pb.WriteBits(overallScaleFactor[iCh], codingParams.nScaleBits)
+                for iBand in range(sfBands_short.nBands):
+                    ba = bitAlloc[iCh][iBand]
+                    if ba: ba -= 1
+                    pb.WriteBits(ba, codingParams.nMantSizeBits)
+                    pb.WriteBits(scaleFactor[iCh][iBand], codingParams.nScaleBits)
+                pb.WriteBits(entropy_pb_short.buffer, entropy_pb_short.nBits)
+            elif AC2A_BLOCK_SWITCHING and codingParams.blockType == MEDIUM:
+                pb.WriteBits(overallScaleFactor[iCh], codingParams.nScaleBits)
+                for iBand in range(_sfb_med.nBands):
+                    ba = bitAlloc[iCh][iBand]
+                    if ba: ba -= 1
+                    pb.WriteBits(ba, codingParams.nMantSizeBits)
+                    pb.WriteBits(scaleFactor[iCh][iBand], codingParams.nScaleBits)
+                pb.WriteBits(entropy_pb.buffer, entropy_pb.nBits)
+            elif codingParams.blockType == SHORT:
+                # Edler SHORT: grouping mask + groups
                 pb.WriteBits(codingParams.grouping_mask, 7)
                 ep_idx = 0
                 sub_idx = 0
@@ -593,15 +1032,66 @@ class RMCFile(AudioFile):
                         pb.WriteBits(entropy_pbs[ep_idx].buffer, entropy_pbs[ep_idx].nBits)
                         ep_idx += 1
                     sub_idx += G
+                if TNS:
+                    for info in tns_short_info[iCh]:
+                        pb.WriteBits(1 if info["enabled"] else 0, 1)
+                        if info["enabled"]:
+                            pb.WriteBits(coeff_to_bits(info["coeff_q"]), TNS_COEFF_BITS)
             else:
+                # LONG and START/STOP (AC-2A or Edler) — _sfb_enc already computed above
                 pb.WriteBits(overallScaleFactor[iCh], codingParams.nScaleBits)
-                for iBand in range(codingParams.sfBands.nBands):
+                for iBand in range(_sfb_enc.nBands):
                     ba = bitAlloc[iCh][iBand]
                     if ba: ba -= 1
                     pb.WriteBits(ba, codingParams.nMantSizeBits)
                     pb.WriteBits(scaleFactor[iCh][iBand], codingParams.nScaleBits)
                 pb.WriteBits(entropy_pb.buffer, entropy_pb.nBits)
+            # Sub-bass hybrid: append K low-band bins after mantissa data
+            if SUBBASS_HYBRID and (codingParams.blockType != LONG or is_adjacent_long) and iCh in lpf_low_k_bins:
+                from quantize import ScaleFactor as _SF2, vMantissa as _vM2
+                low_bins = lpf_low_k_bins[iCh]
+                max_abs  = np.max(np.abs(low_bins)) if np.any(low_bins != 0) else 1e-10
+                ovs = _SF2(max_abs, codingParams.nScaleBits)
+                scaled = low_bins * (1 << ovs)
+                max_sc = np.max(np.abs(scaled)) if np.any(scaled != 0) else 1e-10
+                sf  = _SF2(max_sc, codingParams.nScaleBits, subbass.LOW_MANT_BITS)
+                mant = _vM2(scaled, sf, codingParams.nScaleBits, subbass.LOW_MANT_BITS)
+                pb.WriteBits(int(ovs), codingParams.nScaleBits)
+                pb.WriteBits(int(sf),  codingParams.nScaleBits)
+                mask = (1 << subbass.LOW_MANT_BITS) - 1
+                for m in mant:
+                    pb.WriteBits(int(m) & mask, subbass.LOW_MANT_BITS)
             self.fp.write(pb.GetPackedData())
+
+        # AC-2A: advance sample counter and pre-set nSamplesPerBlock for the next PCM read
+        if AC2A_BLOCK_SWITCHING:
+            codingParams.currentSamplePos += len(data[0])
+            _next_1024_idx = codingParams.currentSamplePos // halfN
+            _k_next = codingParams.transientBlocks.get(_next_1024_idx, -1)
+            _prev_now = codingParams.prevBlockType
+            _rem_now  = codingParams.short_blocks_remaining
+
+            if codingParams.block_queue:
+                # Next block is queued (MEDIUM or STOP) — its nSPB = b of that block
+                codingParams.nSamplesPerBlock = codingParams.block_queue[0]['b']
+            elif _prev_now in (LONG, STOP):
+                if _k_next >= 0:
+                    if ADAPTIVE_CASCADE:
+                        _, b_start_next, _, _, _ = plan_cascade(_k_next)
+                        codingParams.nSamplesPerBlock = b_start_next
+                    else:
+                        codingParams.nSamplesPerBlock = halfN_short
+                else:
+                    codingParams.nSamplesPerBlock = halfN
+            elif _prev_now in (START, MEDIUM):
+                codingParams.nSamplesPerBlock = halfN_short
+            elif _prev_now == SHORT:
+                # After the last SHORT we enqueue tail + STOP, so block_queue is non-empty;
+                # this branch is only reached if more SHORTs remain (rem_now > 0).
+                codingParams.nSamplesPerBlock = halfN_short
+            else:  # STOP → LONG
+                codingParams.nSamplesPerBlock = halfN
+
         return
 
     def Close(self,codingParams):
@@ -638,13 +1128,13 @@ class RMCFile(AudioFile):
         #Passes encoding logic to the Encode function defined in the codec module
         return codec.Encode(data,codingParams)
 
-    def Decode(self,scaleFactor,bitAlloc,mantissa, overallScaleFactor,codingParams,mdct_pred=None):
+    def Decode(self,scaleFactor,bitAlloc,mantissa, overallScaleFactor,codingParams,mdct_pred=None,tns_info=None):
         """
         Decodes a single audio channel of data based on the values of its scale factors,
         bit allocations, quantized mantissas, and overall scale factor.
         """
         #Passes decoding logic to the Decode function defined in the codec module
-        return codec.Decode(scaleFactor,bitAlloc,mantissa, overallScaleFactor,codingParams,mdct_pred)
+        return codec.Decode(scaleFactor,bitAlloc,mantissa, overallScaleFactor,codingParams,mdct_pred,tns_info)
 
 
 
@@ -657,5 +1147,5 @@ if __name__ == "__main__":
     from prepare_materials import rmc
     import time
     elapsed = time.time()
-    rmc("inputs/Brooklyn.wav", "Brooklyn_96.wav", rate_kb=96)
+    rmc("Van_124.wav", "VAN_96_onlyBS.wav", rate_kb=96)
     print(f"\nDone in {time.time() - elapsed:.1f}s")

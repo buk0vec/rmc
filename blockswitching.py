@@ -15,15 +15,17 @@ Music 422 -- RMC Project
 import numpy as np
 from psychoac import ScaleFactorBands, AssignMDCTLinesFromFreqLimits
 from window import KBDWindow
+from features import AC2A_BLOCK_SWITCHING, ADAPTIVE_CASCADE
 
 # ---------------------------------------------------------------------------
 # Block type constants
 # ---------------------------------------------------------------------------
 
-LONG  = 0   # Normal long block (high frequency resolution)
-START = 1   # Transition block: long -> short
-SHORT = 2   # Short block (high time resolution, used near transients)
-STOP  = 3   # Transition block: short -> long
+LONG   = 0   # Normal long block (high frequency resolution)
+START  = 1   # Transition block: long -> short
+SHORT  = 2   # Short block (high time resolution, used near transients)
+STOP   = 3   # Transition block: short -> long
+MEDIUM = 4   # Cascade intermediate: rising-sine(a) | falling-sine(b)
 
 # Number of short blocks that replace one long block
 N_SHORT_BLOCKS = 8
@@ -240,25 +242,251 @@ def StopWindowFunc(N_long, N_short):
     return w
 
 
-def WindowForBlockType(block_type, N_long, N_short):
+def AC2AStartWindowFunc(N_long, N_short):
+    """
+    1152-sample AC-2A START transition window.
+
+    Left half (1024): rising side of the KBD long window.
+    Right half (128): falling side of the short sine window.
+
+    MDCT(data[1152], 1024, 128) with this window gives n_0=64.5,
+    which is TDAC-compatible with SHORT blocks on the right.
+    """
+    halfN = N_long // 2   # 1024
+    halfS = N_short // 2  # 128
+    N_trans = halfN + halfS  # 1152
+    w = np.zeros(N_trans)
+    kbd_long = KBDWindow(np.ones(N_long), alpha=4)
+    w[:halfN] = kbd_long[:halfN]
+    w_short = ShortWindowFunc(N_short)
+    w[halfN:halfN + halfS] = w_short[halfS:]
+    return w
+
+
+def AC2AStopWindowFunc(N_long, N_short):
+    """
+    1152-sample AC-2A STOP transition window (time-reverse of START).
+
+    Left half (128): rising side of the short sine window.
+    Right half (1024): falling side of the KBD long window.
+
+    MDCT(data[1152], 128, 1024) with this window gives n_0=512.5,
+    which is TDAC-compatible with LONG blocks on the right.
+    """
+    halfN = N_long // 2   # 1024
+    halfS = N_short // 2  # 128
+    N_trans = halfN + halfS  # 1152
+    w = np.zeros(N_trans)
+    w_short = ShortWindowFunc(N_short)
+    w[:halfS] = w_short[:halfS]
+    kbd_long = KBDWindow(np.ones(N_long), alpha=4)
+    w[halfS:] = kbd_long[halfN:]
+    return w
+
+
+def AC2AStartWindowFuncVar(N_long, b):
+    """
+    AC2A START window with variable right overlap b (128, 256, or 512).
+    Left 1024 samples: rising KBD long.  Right b//2 samples: falling sine_b.
+    Used for cascade L>=2 where b > N_short//2.
+    """
+    halfN = N_long // 2   # 1024
+    halfB = b // 2
+    w = np.zeros(halfN + halfB)
+    kbd_long = KBDWindow(np.ones(N_long), alpha=4)
+    w[:halfN] = kbd_long[:halfN]
+    w_b = ShortWindowFunc(b)
+    w[halfN:halfN + halfB] = w_b[halfB:]   # falling half of sine_b
+    return w
+
+
+def MediumTransWindowFunc(a, b):
+    """
+    Cascade intermediate window: rising sine_2a (left a samples) | falling sine_2b (right b samples).
+    TDAC-compatible with any block whose right overlap equals a on the left,
+    and any block whose left overlap equals b on the right.
+    """
+    w = np.zeros(a + b)
+    w[:a] = ShortWindowFunc(2 * a)[:a]   # rising half of sine_2a
+    w[a:] = ShortWindowFunc(2 * b)[b:]   # falling half of sine_2b
+    return w
+
+
+def AC2AStopWindowFuncVar(N_long, a):
+    """
+    AC-2A STOP window with variable left overlap: left a//2 samples rising sine_a,
+    right N_long//2 samples falling KBD long.  Mirror image of AC2AStartWindowFuncVar.
+
+    Used for the tail of a symmetric cascade where the block preceding STOP has a
+    right overlap larger than the standard halfN_short=128.
+
+    Arguments:
+        N_long -- long window length (= 2 * nMDCTLines_long, e.g. 2048)
+        a      -- full left-overlap window size (e.g. 512 → halfA=256 overlap samples)
+
+    Returns:
+        numpy array of length (a//2 + N_long//2)
+    """
+    halfN = N_long // 2   # 1024
+    halfA = a // 2
+    w = np.zeros(halfA + halfN)
+    w_a = ShortWindowFunc(a)
+    w[:halfA] = w_a[:halfA]           # rising half of sine_a
+    kbd_long = KBDWindow(np.ones(N_long), alpha=4)
+    w[halfA:] = kbd_long[halfN:]      # falling KBD long
+    return w
+
+
+def plan_cascade(k_attack):
+    """
+    Given a transient at sub-block k_attack (0..7), returns the cascade plan.
+
+    Returns (L, b_start, medium_lead, medium_tail, stop_a):
+        L            -- cascade depth (1 = standard, 2 or 3 = telescoping)
+        b_start      -- right half-overlap of START (128, 256, or 512)
+        medium_lead  -- list of (a, b) MEDIUM tuples BEFORE the SHORT
+        medium_tail  -- list of (a, b) MEDIUM tuples AFTER the SHORT (zoom back out)
+        stop_a       -- cascade_a for the trailing STOP block (128=standard, 512=wide)
+
+    Symmetric telescope: zoom in before the SHORT, zoom out after.
+    Always exactly 1 SHORT per cascade event.
+
+    Sample balance (nSPB):
+        b_start + sum(b for a,b in medium_lead) + 128 [SHORT]
+      + sum(b for a,b in medium_tail) + 1024 [STOP]  = 2048
+
+    L=1 (k<2):  b_start=128, 0 lead MEDIUMs, tail=[(128,256),(256,512)], stop_a=512
+    L=2 (k=2..5): b_start=256, 1 lead MEDIUM (256,128), tail=[(128,512)], stop_a=512
+    L=3 (k=6..7): b_start=512, 2 lead MEDIUMs, no tail, stop_a=128 (standard STOP)
+    """
+    import math
+    if k_attack < 2:
+        return 1, 128, [], [(128, 256), (256, 512)], 512
+    L = int(math.floor(math.log2(k_attack + 2)))
+    L = min(L, 3)
+    b_start = (1 << (L - 1)) * 128
+    medium_lead = []
+    b_cur = b_start
+    while b_cur > 128:
+        b_next = b_cur // 2
+        medium_lead.append((b_cur, b_next))
+        b_cur = b_next
+    if L == 3:
+        medium_tail = []
+        stop_a = 128          # standard STOP: N_short // 2
+    else:
+        # L=2: tail covers 512 samples (= 2048 - 256 - 128 - 128 - 1024)
+        medium_tail = [(128, 512)]
+        stop_a = 512          # STOP_VAR: wide left overlap
+    return L, b_start, medium_lead, medium_tail, stop_a
+
+
+_sfbands_cache = {}
+
+def DesignSFBands(nLines, sampleRate, min_lines=4, max_lines=100):
+    """
+    Bark-scale sfBands for any MDCT block size.
+
+    Merges adjacent raw Bark bands until each has >= min_lines, then splits
+    any band exceeding max_lines into two halves. Result is cached by (nLines, sampleRate).
+    Falls through to the hand-tuned tables for the standard 128-line SHORT and
+    576-line transition blocks.
+    """
+    if nLines == 128:
+        return ShortBlockSFBands(128, sampleRate)
+    if nLines == 576 and sampleRate == 44100:
+        return TransitionSFBands(576, sampleRate)
+
+    key = (nLines, sampleRate)
+    if key in _sfbands_cache:
+        return _sfbands_cache[key]
+
+    raw = AssignMDCTLinesFromFreqLimits(nLines, sampleRate)
+
+    merged, acc = [], 0
+    for n in raw:
+        acc += n
+        if acc >= min_lines:
+            merged.append(acc)
+            acc = 0
+    if acc > 0:
+        if merged:
+            merged[-1] += acc
+        else:
+            merged.append(acc)
+
+    result = []
+    for n in merged:
+        if n > max_lines:
+            h = n // 2
+            result.extend([h, n - h])
+        else:
+            result.append(n)
+
+    sfb = ScaleFactorBands(np.array(result))
+    _sfbands_cache[key] = sfb
+    return sfb
+
+
+def TransitionSFBands(nMDCTLines_trans, sampleRate):
+    """Scale factor bands for AC-2A transition blocks (576 lines at 44100 Hz).
+
+    At 38.3 Hz/bin resolution the narrow low-frequency Bark bands (< 4 lines each)
+    are merged in pairs so no band falls below 4 lines.  The wide top-of-spectrum
+    band (>15.5 kHz, 171 lines in the raw Bark table) is split at 18 kHz into two
+    bands (65 + 106 lines) to avoid one band monopolising 30% of the budget.
+    Result: 23 bands, min 4 lines, max 106 lines, total exactly 576.
+    """
+    if nMDCTLines_trans == 576 and sampleRate == 44100:
+        nLines = np.array([5, 5, 6, 4, 4, 4, 5, 6, 6, 7, 9, 10, 11,
+                           15, 18, 23, 29, 34, 47, 65, 92, 65, 106])
+        return ScaleFactorBands(nLines)
+    # Fallback for non-standard block sizes / sample rates
+    nLines = AssignMDCTLinesFromFreqLimits(nMDCTLines_trans, sampleRate)
+    return ScaleFactorBands(nLines)
+
+
+def WindowForBlockType(block_type, N_long, N_short, k_attack=None,
+                       cascade_a=None, cascade_b=None):
     """
     Convenience dispatcher: returns the window array for the given block type.
 
+    For AC-2A cascade blocks pass cascade_a and cascade_b (the actual overlap
+    sizes for the current block); these override the default N_long/N_short.
+
     Arguments:
-        block_type -- one of {LONG, START, SHORT, STOP}
+        block_type -- one of {LONG, START, SHORT, STOP, MEDIUM}
         N_long     -- long window length (= 2 * nMDCTLines_long)
         N_short    -- short window length (= 2 * nMDCTLines_short)
+        k_attack   -- transient sub-block index (optional, legacy)
+        cascade_a  -- left overlap size for current block (overrides default)
+        cascade_b  -- right overlap size for current block (overrides default)
 
     Returns:
-        numpy array of length N_long (for LONG/START/STOP) or N_short (for SHORT)
+        numpy array of length (cascade_a + cascade_b) for MEDIUM/cascade START/STOP,
+        N_long for standard LONG/START/STOP, or N_short for SHORT.
     """
     if block_type == LONG:
         return LongWindowFunc(N_long)
     elif block_type == SHORT:
         return ShortWindowFunc(N_short)
+    elif block_type == MEDIUM:
+        a = cascade_a if cascade_a is not None else N_long // 4
+        b = cascade_b if cascade_b is not None else N_short // 2
+        return MediumTransWindowFunc(a, b)
     elif block_type == START:
+        if AC2A_BLOCK_SWITCHING:
+            b = cascade_b if cascade_b is not None else N_short // 2
+            if b != N_short // 2:
+                return AC2AStartWindowFuncVar(N_long, b * 2)
+            return AC2AStartWindowFunc(N_long, N_short)
         return StartWindowFunc(N_long, N_short)
     elif block_type == STOP:
+        if AC2A_BLOCK_SWITCHING:
+            a = cascade_a if cascade_a is not None else N_short // 2
+            if a != N_short // 2:
+                return AC2AStopWindowFuncVar(N_long, a * 2)
+            return AC2AStopWindowFunc(N_long, N_short)
         return StopWindowFunc(N_long, N_short)
 
 
@@ -285,8 +513,12 @@ def ShortBlockSFBands(nMDCTLines_short, sampleRate):
     Returns:
         ScaleFactorBands object appropriate for short-block encoding
     """
-    nLines = np.array([4, 4, 4, 4, 4, 8, 8, 8, 12, 12, 12, 16, 16, 16]) #from AAC short window 
-  
+    # Perceptually-motivated 12-band table for 128 MDCT lines at 44100 Hz.
+    # Bands 0-8 match the AAC table (0-9647 Hz, ~1-6 Bark each).
+    # Bands 9-11 collapse the original 5 ultra-high-freq bands (each only 0.2-0.8 Bark)
+    # into 3 bands of ~1 Bark each — reducing overhead without losing audible resolution.
+    nLines = np.array([4, 4, 4, 4, 4, 8, 8, 8, 12, 16, 24, 32])
+
     return ScaleFactorBands(nLines)
 
 

@@ -22,6 +22,68 @@ def groupConsecutiveBlocks(blockList):
     return [group[0] for group in groups]
 
 
+def groupConsecutiveBlockRanges(blockList):
+    """Return [(start_block, end_block), ...] for consecutive runs."""
+    if len(blockList) == 0:
+        return []
+    start = int(blockList[0])
+    prev = int(blockList[0])
+    ranges = []
+    for block in blockList[1:]:
+        block = int(block)
+        if block == prev + 1:
+            prev = block
+        else:
+            ranges.append((start, prev))
+            start = block
+            prev = block
+    ranges.append((start, prev))
+    return ranges
+
+
+def enforceMinEventSpacing(events, min_spacing_blocks=1):
+    """
+    Keep only the first transient event in any nearby block cluster.
+    """
+    if len(events) == 0:
+        return []
+
+    min_spacing_blocks = max(1, int(min_spacing_blocks))
+    filtered = [events[0]]
+    last_kept_block = int(events[0]["block"])
+
+    for event in events[1:]:
+        block = int(event["block"])
+        if (block - last_kept_block) >= min_spacing_blocks:
+            filtered.append(event)
+            last_kept_block = block
+
+    return filtered
+
+
+def enforceMinBlockSpacing(blockList, min_spacing_blocks=1):
+    """
+    Keep only the first onset in any cluster of nearby blocks.
+
+    This suppresses duplicate detections that are a few blocks apart but
+    correspond to the same physical attack envelope.
+    """
+    if len(blockList) == 0:
+        return []
+
+    min_spacing_blocks = max(1, int(min_spacing_blocks))
+    filtered = [int(blockList[0])]
+    last_kept = filtered[0]
+
+    for block in blockList[1:]:
+        block = int(block)
+        if (block - last_kept) >= min_spacing_blocks:
+            filtered.append(block)
+            last_kept = block
+
+    return filtered
+
+
 def combineTimeAndFreqOnsets(blocks_time, blocks_cwt, tolerance_blocks=1):
     """Combine time-domain and frequency-domain onset detections"""
     if len(blocks_time) == 0:
@@ -196,8 +258,10 @@ def analyzeAudioCharacteristics(audioData, sr):
 def detectTransients(audioPath, sr=22050, duration=None,
                      use_auto_params=True,
                      blockSize=1024,
+                     forceBlockSize=None,
                      cwt_onset_threshold=0.3,
                      time_threshold_factor=0.25,
+                     return_events=False,
                      verbose=True):
     """
     Detect transients and return combined block array.
@@ -233,6 +297,9 @@ def detectTransients(audioPath, sr=22050, duration=None,
         cwt_min_distance_ms = 50
         cwt_freq_weight = 1.5
 
+    if forceBlockSize is not None:
+        blockSize = int(forceBlockSize)
+
     # TIME-DOMAIN DETECTION
     fast_envelope = envelopeFollower(audioData, sr, 0.5, 5.0, mode='peak')
     slow_envelope = envelopeFollower(audioData, sr, 10.0, 50.0, mode='peak')
@@ -249,7 +316,39 @@ def detectTransients(audioPath, sr=22050, duration=None,
         i for i in range(numBlocks_time)
         if np.any(transient_time_mono[i*blockSize : min((i+1)*blockSize, len(transient_time_mono))] > 0.001)
     ]
-    transientBlocks_time = groupConsecutiveBlocks(transientBlocks_time_multi)
+    # Build onset events with within-block sample offsets by taking the first
+    # threshold crossing in each consecutive block run.
+    onset_threshold = 0.001
+    event_ranges = groupConsecutiveBlockRanges(transientBlocks_time_multi)
+    transient_events = []
+    for start_block, end_block in event_ranges:
+        lo = start_block * blockSize
+        hi = min((end_block + 1) * blockSize, len(transient_time_mono))
+        segment = transient_time_mono[lo:hi]
+        hit = np.flatnonzero(segment > onset_threshold)
+        if hit.size > 0:
+            sample_index = lo + int(hit[0])
+        else:
+            sample_index = lo
+        transient_events.append({
+            "block": int(sample_index // blockSize),
+            "sample_offset": int(sample_index % blockSize),
+            "sample_index": int(sample_index),
+        })
+
+    transientBlocks_time = [event["block"] for event in transient_events]
+
+    # Debounce near-duplicate onsets using a spacing derived from the
+    # existing transient-distance setting.
+    min_spacing_blocks = max(
+        1,
+        int(round((cwt_min_distance_ms / 1000.0) * sr / blockSize))
+    )
+    transient_events = enforceMinEventSpacing(
+        transient_events,
+        min_spacing_blocks=min_spacing_blocks
+    )
+    transientBlocks_time = [event["block"] for event in transient_events]
 
     # CWT DETECTION via pywt
     # dt = 1.0 / sr
@@ -279,6 +378,8 @@ def detectTransients(audioPath, sr=22050, duration=None,
         print(f"  Time-domain blocks ({len(transientBlocks_time)}): {transientBlocks_time}")
     # print(f"  CWT blocks         ({len(transientBlocks_cwt)}): {transientBlocks_cwt}")
 
+    if return_events:
+        return transient_events
     return np.array(transientBlocks_time)
 
 
