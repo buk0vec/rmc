@@ -8,7 +8,7 @@ they were encoded with.
 
 ENTROPY_CODING       = False  # range-coded mantissas; False = raw bit writes
 VARIABLE_BIT_RATE    = False  # adaptive entropy-inflation EMA; False = inflation fixed at 1.0
-BLOCK_SWITCHING      = False  # transient-driven SHORT blocks; False = all LONG
+BLOCK_SWITCHING      = True   # transient-driven SHORT blocks; False = all LONG
 MID_SIDE_CODING      = False  # M/S stereo; False = always L/R
 PREDICTION           = False  # rhythmic prediction search; False = no prediction
 SHORT_BLOCK_BITBOOST = False  # 2× bit budget for SHORT blocks; False = 1× (requires BLOCK_SWITCHING)

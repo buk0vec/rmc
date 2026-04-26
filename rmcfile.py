@@ -14,6 +14,7 @@ import codec    # module where the actual PAC coding functions reside(this modul
 from psychoac import ScaleFactorBands, AssignMDCTLinesFromFreqLimits  # defines the grouping of MDCT lines into scale factor bands
 from entropy import BlockEntropyCoder, RawMantissaCoder
 from features import ENTROPY_CODING, VARIABLE_BIT_RATE, MID_SIDE_CODING, PREDICTION, SUBBASS_HYBRID, TNS, AC2A_BLOCK_SWITCHING, ADAPTIVE_CASCADE
+import bisect
 from blockswitching import LONG, START, SHORT, STOP, MEDIUM, N_SHORT_BLOCKS, ShortBlockSFBands, TransitionSFBands, WindowForBlockType, SelectBlockType, mask_to_group_lens, plan_cascade, DesignSFBands
 from mdct import MDCT, IMDCT
 from search import get_best_region, PRED_MAP, GAIN_TABLE, pred_type_to_samples, update_search_buffer
@@ -66,9 +67,10 @@ class RMCFile(AudioFile):
             myParams.sfBands_trans = TransitionSFBands(_nMDCTLines_trans, sampleRate)
         myParams.prevBlockType = LONG
         myParams.blockType = LONG
-        myParams.block_queue = []        # cascade: queued MEDIUM block dims
-        myParams.cascade_a = nMDCTLines  # current block left overlap
-        myParams.cascade_b = nMDCTLines  # current block right overlap
+        myParams.block_queue = []
+        myParams.cascade_a = nMDCTLines
+        myParams.cascade_b = nMDCTLines
+        myParams.transientPositions = []  # populated by encoder; decoder doesn't need it
         # add in scale factor band information
         myParams.sfBands =sfBands
 
@@ -103,7 +105,8 @@ class RMCFile(AudioFile):
         """
         halfN = codingParams.nMDCTLines
         N = 2 * halfN
-        N_short = 2 * codingParams.nMDCTLines_short
+        halfN_short = codingParams.nMDCTLines_short
+        N_short = 2 * halfN_short
         sfBands_short = codingParams.sfBands_short
 
         # First pass: read all channels and decode (M/S or L/R depending on flag)
@@ -132,19 +135,14 @@ class RMCFile(AudioFile):
             if AC2A_BLOCK_SWITCHING and codingParams.blockType == START:
                 k_attack_read = pb.ReadBits(3)
                 codingParams.k_attack_for_stop = k_attack_read
-                if ADAPTIVE_CASCADE:
-                    L, b_start, medium_lead, medium_tail, stop_a = plan_cascade(k_attack_read)
-                else:
-                    b_start = codingParams.nMDCTLines_short
-                    medium_lead, medium_tail, stop_a = [], [(codingParams.nMDCTLines_short, 256), (256, 512)], 512
+                b_start = (7 + k_attack_read) * halfN_short  # recover exact b_start
+                medium_lead = plan_cascade(k_attack_read)
                 codingParams.cascade_a = halfN
                 codingParams.cascade_b = b_start
-                codingParams.cascade_stop_a = stop_a
-                # Queue: lead MEDIUMs first, then tail MEDIUMs after SHORT (SHORT not in queue)
-                codingParams.block_queue = (
-                    [{'type': MEDIUM, 'a': ma, 'b': mb} for (ma, mb) in medium_lead] +
-                    [{'type': MEDIUM, 'a': ta, 'b': tb} for (ta, tb) in medium_tail]
-                )
+                # Queue only lead MEDIUMs; STOP is always standard (cascade_a=128)
+                codingParams.block_queue = [
+                    {'type': MEDIUM, 'a': ma, 'b': mb} for (ma, mb) in medium_lead
+                ]
             elif AC2A_BLOCK_SWITCHING and codingParams.blockType == MEDIUM:
                 # Pop cascade dims from queue only on first channel (shared state)
                 if iCh == 0 and getattr(codingParams, 'block_queue', []):
@@ -158,9 +156,7 @@ class RMCFile(AudioFile):
                     codingParams.cascade_a = len(codingParams.overlapAndAdd[iCh])
                     codingParams.cascade_b = codingParams.nMDCTLines_short
             if AC2A_BLOCK_SWITCHING and codingParams.blockType == STOP:
-                # cascade_stop_a was stored when START was read; use it for variable-left STOP
-                codingParams.cascade_a = getattr(codingParams, 'cascade_stop_a',
-                                                 codingParams.nMDCTLines_short)
+                codingParams.cascade_a = halfN_short  # always standard STOP
                 codingParams.cascade_b = halfN
             if SUBBASS_HYBRID and codingParams.blockType == LONG:
                 has_subbass = bool(pb.ReadBits(1))
@@ -411,21 +407,16 @@ class RMCFile(AudioFile):
             codingParams.currentSamplePos = 0
             codingParams.short_blocks_remaining = 0
             # Pre-set nSamplesPerBlock for the first PCM read
-            _tb = getattr(codingParams, 'transientBlocks', {})
-            _k0 = _tb.get(0, -1)
-            if _k0 >= 0:
-                if ADAPTIVE_CASCADE:
-                    from blockswitching import plan_cascade as _pc
-                    _, _bs0, _, _, _ = _pc(_k0)
-                    codingParams.nSamplesPerBlock = _bs0
-                else:
-                    codingParams.nSamplesPerBlock = codingParams.nMDCTLines_short
+            _positions0 = getattr(codingParams, 'transientPositions', [])
+            if _positions0:
+                _raw0 = _positions0[0]
+                _k0 = max(0, min(7, (_raw0 - codingParams.nMDCTLines) // codingParams.nMDCTLines_short))
+                _bs0 = (7 + _k0) * codingParams.nMDCTLines_short
+                codingParams.nSamplesPerBlock = _bs0
         codingParams.blockType = LONG
         codingParams.block_queue = []
         codingParams.cascade_a = codingParams.nMDCTLines
         codingParams.cascade_b = codingParams.nMDCTLines
-        codingParams.cascade_tail = []
-        codingParams.cascade_stop_a = codingParams.nMDCTLines_short
         codingParams.entropyCoder_long = BlockEntropyCoder(14) if ENTROPY_CODING else RawMantissaCoder()
         codingParams.entropyCoder_short = BlockEntropyCoder(14) if ENTROPY_CODING else RawMantissaCoder()
 
@@ -482,13 +473,24 @@ class RMCFile(AudioFile):
 
         # AC-2A: determine block type and cascade dimensions before building analysis windows
         if AC2A_BLOCK_SWITCHING:
-            block_1024_idx = codingParams.currentSamplePos // halfN
-            k_attack = codingParams.transientBlocks.get(block_1024_idx, -1)
+            # Find the next transient within 2 * halfN samples using exact positions
+            _positions = getattr(codingParams, 'transientPositions', [])
+            _pos = codingParams.currentSamplePos
+            _tidx = bisect.bisect_left(_positions, _pos)
+            if _tidx < len(_positions) and _positions[_tidx] < _pos + 2 * halfN:
+                _raw_offset = _positions[_tidx] - _pos
+                _k_encoded = max(0, min(7, (_raw_offset - halfN) // halfN_short))
+                _b_start = (7 + _k_encoded) * halfN_short
+                k_attack = _k_encoded
+            else:
+                _b_start = halfN_short
+                k_attack = -1
+
             _prev = codingParams.prevBlockType
             _rem  = codingParams.short_blocks_remaining
 
             if codingParams.block_queue:
-                # Pop next planned MEDIUM block from cascade queue
+                # Pop next planned MEDIUM or STOP block from cascade queue
                 qitem = codingParams.block_queue.pop(0)
                 _bt = qitem['type']
                 codingParams.cascade_a = qitem['a']
@@ -496,23 +498,13 @@ class RMCFile(AudioFile):
             elif _prev in (LONG, STOP):
                 if k_attack >= 0:
                     _bt = START
-                    if ADAPTIVE_CASCADE:
-                        L, b_start, medium_lead, medium_tail, stop_a = plan_cascade(k_attack)
-                        codingParams.cascade_a = halfN
-                        codingParams.cascade_b = b_start
-                        for (ma, mb) in medium_lead:
-                            codingParams.block_queue.append(
-                                {'type': MEDIUM, 'a': ma, 'b': mb}
-                            )
-                    else:
-                        b_start = halfN_short
-                        medium_tail, stop_a = [(halfN_short, 256), (256, 512)], 512
-                        codingParams.cascade_a = halfN
-                        codingParams.cascade_b = halfN_short
+                    medium_lead = plan_cascade(_k_encoded)
+                    codingParams.cascade_a = halfN
+                    codingParams.cascade_b = _b_start
+                    for (ma, mb) in medium_lead:
+                        codingParams.block_queue.append({'type': MEDIUM, 'a': ma, 'b': mb})
                     codingParams.short_blocks_remaining = 1
-                    codingParams.cascade_tail = medium_tail
-                    codingParams.cascade_stop_a = stop_a
-                    codingParams.k_attack_for_stop = max(0, k_attack)
+                    codingParams.k_attack_for_stop = _k_encoded
                 else:
                     _bt = LONG
                     codingParams.cascade_a = halfN
@@ -522,13 +514,11 @@ class RMCFile(AudioFile):
                 codingParams.cascade_a = halfN_short
                 codingParams.cascade_b = halfN_short
             elif _prev == SHORT:
-                _bt = SHORT if _rem > 0 else STOP
-                if _bt == STOP:
-                    codingParams.cascade_a = halfN_short
-                    codingParams.cascade_b = halfN
-                else:
-                    codingParams.cascade_a = halfN_short
-                    codingParams.cascade_b = halfN_short
+                # STOP is always queued when short_blocks_remaining hits 0,
+                # so this branch is only reached when _rem > 0 (more SHORTs).
+                _bt = SHORT
+                codingParams.cascade_a = halfN_short
+                codingParams.cascade_b = halfN_short
             else:  # STOP → LONG
                 _bt = LONG
                 codingParams.cascade_a = halfN
@@ -539,11 +529,8 @@ class RMCFile(AudioFile):
             if _bt == SHORT:
                 codingParams.short_blocks_remaining -= 1
                 if codingParams.short_blocks_remaining == 0:
-                    for (ta, tb) in codingParams.cascade_tail:
-                        codingParams.block_queue.append({'type': MEDIUM, 'a': ta, 'b': tb})
-                    codingParams.block_queue.append(
-                        {'type': STOP, 'a': codingParams.cascade_stop_a, 'b': halfN}
-                    )
+                    # No tail mediums — STOP_std directly after SHORT
+                    codingParams.block_queue.append({'type': STOP, 'a': halfN_short, 'b': halfN})
             codingParams.group_lens = None
             codingParams.grouping_mask = 0
 
@@ -553,7 +540,12 @@ class RMCFile(AudioFile):
         new_prior = []
         for iCh in range(codingParams.nChannels):
             all_samples = np.concatenate((codingParams.priorBlock[iCh], data[iCh]))
-            new_prior.append(all_samples[-halfN:])  # rolling 1024-sample prior
+            # After START, keep b_start samples so MEDIUM's left overlap is fully covered
+            _keep = (codingParams.cascade_b
+                     if AC2A_BLOCK_SWITCHING and codingParams.blockType == START
+                        and codingParams.cascade_b > halfN
+                     else halfN)
+            new_prior.append(all_samples[-_keep:])
             if AC2A_BLOCK_SWITCHING:
                 _bt = codingParams.blockType
                 if _bt == LONG:
@@ -1066,28 +1058,31 @@ class RMCFile(AudioFile):
         # AC-2A: advance sample counter and pre-set nSamplesPerBlock for the next PCM read
         if AC2A_BLOCK_SWITCHING:
             codingParams.currentSamplePos += len(data[0])
-            _next_1024_idx = codingParams.currentSamplePos // halfN
-            _k_next = codingParams.transientBlocks.get(_next_1024_idx, -1)
             _prev_now = codingParams.prevBlockType
-            _rem_now  = codingParams.short_blocks_remaining
+
+            # Look ahead from new position for the next transient
+            _pos_next = codingParams.currentSamplePos
+            _positions = getattr(codingParams, 'transientPositions', [])
+            _tidx_next = bisect.bisect_left(_positions, _pos_next)
+            if _tidx_next < len(_positions) and _positions[_tidx_next] < _pos_next + 2 * halfN:
+                _raw_next = _positions[_tidx_next] - _pos_next
+                _k_next = max(0, min(7, (_raw_next - halfN) // halfN_short))
+                _b_next = (7 + _k_next) * halfN_short
+                _k_next_valid = True
+            else:
+                _b_next = halfN
+                _k_next_valid = False
 
             if codingParams.block_queue:
                 # Next block is queued (MEDIUM or STOP) — its nSPB = b of that block
                 codingParams.nSamplesPerBlock = codingParams.block_queue[0]['b']
             elif _prev_now in (LONG, STOP):
-                if _k_next >= 0:
-                    if ADAPTIVE_CASCADE:
-                        _, b_start_next, _, _, _ = plan_cascade(_k_next)
-                        codingParams.nSamplesPerBlock = b_start_next
-                    else:
-                        codingParams.nSamplesPerBlock = halfN_short
-                else:
-                    codingParams.nSamplesPerBlock = halfN
+                codingParams.nSamplesPerBlock = _b_next if _k_next_valid else halfN
             elif _prev_now in (START, MEDIUM):
                 codingParams.nSamplesPerBlock = halfN_short
             elif _prev_now == SHORT:
-                # After the last SHORT we enqueue tail + STOP, so block_queue is non-empty;
-                # this branch is only reached if more SHORTs remain (rem_now > 0).
+                # STOP was just queued; block_queue is non-empty so this branch
+                # is only reached if more SHORTs remain.
                 codingParams.nSamplesPerBlock = halfN_short
             else:  # STOP → LONG
                 codingParams.nSamplesPerBlock = halfN

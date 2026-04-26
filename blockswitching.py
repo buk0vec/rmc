@@ -312,73 +312,13 @@ def MediumTransWindowFunc(a, b):
     return w
 
 
-def AC2AStopWindowFuncVar(N_long, a):
-    """
-    AC-2A STOP window with variable left overlap: left a//2 samples rising sine_a,
-    right N_long//2 samples falling KBD long.  Mirror image of AC2AStartWindowFuncVar.
-
-    Used for the tail of a symmetric cascade where the block preceding STOP has a
-    right overlap larger than the standard halfN_short=128.
-
-    Arguments:
-        N_long -- long window length (= 2 * nMDCTLines_long, e.g. 2048)
-        a      -- full left-overlap window size (e.g. 512 → halfA=256 overlap samples)
-
-    Returns:
-        numpy array of length (a//2 + N_long//2)
-    """
-    halfN = N_long // 2   # 1024
-    halfA = a // 2
-    w = np.zeros(halfA + halfN)
-    w_a = ShortWindowFunc(a)
-    w[:halfA] = w_a[:halfA]           # rising half of sine_a
-    kbd_long = KBDWindow(np.ones(N_long), alpha=4)
-    w[halfA:] = kbd_long[halfN:]      # falling KBD long
-    return w
-
-
 def plan_cascade(k_attack):
     """
-    Given a transient at sub-block k_attack (0..7), returns the cascade plan.
-
-    Returns (L, b_start, medium_lead, medium_tail, stop_a):
-        L            -- cascade depth (1 = standard, 2 or 3 = telescoping)
-        b_start      -- right half-overlap of START (128, 256, or 512)
-        medium_lead  -- list of (a, b) MEDIUM tuples BEFORE the SHORT
-        medium_tail  -- list of (a, b) MEDIUM tuples AFTER the SHORT (zoom back out)
-        stop_a       -- cascade_a for the trailing STOP block (128=standard, 512=wide)
-
-    Symmetric telescope: zoom in before the SHORT, zoom out after.
-    Always exactly 1 SHORT per cascade event.
-
-    Sample balance (nSPB):
-        b_start + sum(b for a,b in medium_lead) + 128 [SHORT]
-      + sum(b for a,b in medium_tail) + 1024 [STOP]  = 2048
-
-    L=1 (k<2):  b_start=128, 0 lead MEDIUMs, tail=[(128,256),(256,512)], stop_a=512
-    L=2 (k=2..5): b_start=256, 1 lead MEDIUM (256,128), tail=[(128,512)], stop_a=512
-    L=3 (k=6..7): b_start=512, 2 lead MEDIUMs, no tail, stop_a=128 (standard STOP)
+    Returns the list of MEDIUM lead blocks for a given k_attack (0..7).
+    k=0 → no MEDIUM; START(128) → SHORT directly.
+    k≥1 → one MEDIUM(k*128 → 128).
     """
-    import math
-    if k_attack < 2:
-        return 1, 128, [], [(128, 256), (256, 512)], 512
-    L = int(math.floor(math.log2(k_attack + 2)))
-    L = min(L, 3)
-    b_start = (1 << (L - 1)) * 128
-    medium_lead = []
-    b_cur = b_start
-    while b_cur > 128:
-        b_next = b_cur // 2
-        medium_lead.append((b_cur, b_next))
-        b_cur = b_next
-    if L == 3:
-        medium_tail = []
-        stop_a = 128          # standard STOP: N_short // 2
-    else:
-        # L=2: tail covers 512 samples (= 2048 - 256 - 128 - 128 - 1024)
-        medium_tail = [(128, 512)]
-        stop_a = 512          # STOP_VAR: wide left overlap
-    return L, b_start, medium_lead, medium_tail, stop_a
+    return [((7 + k_attack) * 128, 128)]
 
 
 _sfbands_cache = {}
@@ -483,9 +423,6 @@ def WindowForBlockType(block_type, N_long, N_short, k_attack=None,
         return StartWindowFunc(N_long, N_short)
     elif block_type == STOP:
         if AC2A_BLOCK_SWITCHING:
-            a = cascade_a if cascade_a is not None else N_short // 2
-            if a != N_short // 2:
-                return AC2AStopWindowFuncVar(N_long, a * 2)
             return AC2AStopWindowFunc(N_long, N_short)
         return StopWindowFunc(N_long, N_short)
 

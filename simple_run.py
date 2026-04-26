@@ -50,10 +50,10 @@ def enforceMinEventSpacing(events, min_spacing_blocks=1):
 
     min_spacing_blocks = max(1, int(min_spacing_blocks))
     filtered = [events[0]]
-    last_kept_block = int(events[0]["block"])
+    last_kept_block = int(events[0].get("gate_block", events[0]["block"]))
 
     for event in events[1:]:
-        block = int(event["block"])
+        block = int(event.get("gate_block", event["block"]))
         if (block - last_kept_block) >= min_spacing_blocks:
             filtered.append(event)
             last_kept_block = block
@@ -304,6 +304,7 @@ def detectTransients(audioPath, sr=22050, duration=None,
     fast_envelope = envelopeFollower(audioData, sr, 0.5, 5.0, mode='peak')
     slow_envelope = envelopeFollower(audioData, sr, 10.0, 50.0, mode='peak')
     envDiff_time = fast_envelope - slow_envelope
+    fast_env_mono = np.maximum(fast_envelope[0], fast_envelope[1])
 
     envDiff_time_mono = np.maximum(envDiff_time[0], envDiff_time[1])
     threshold_time = np.max(envDiff_time_mono) * time_threshold_factor
@@ -316,22 +317,38 @@ def detectTransients(audioPath, sr=22050, duration=None,
         i for i in range(numBlocks_time)
         if np.any(transient_time_mono[i*blockSize : min((i+1)*blockSize, len(transient_time_mono))] > 0.001)
     ]
-    # Build onset events with within-block sample offsets by taking the first
-    # threshold crossing in each consecutive block run.
+    # Build onset events: coarse position from envelope gate, then refine by
+    # finding the local envelope peak and walking back to where the rise began.
     onset_threshold = 0.001
     event_ranges = groupConsecutiveBlockRanges(transientBlocks_time_multi)
     transient_events = []
+    prev_detected = -100000
     for start_block, end_block in event_ranges:
         lo = start_block * blockSize
         hi = min((end_block + 1) * blockSize, len(transient_time_mono))
         segment = transient_time_mono[lo:hi]
         hit = np.flatnonzero(segment > onset_threshold)
         if hit.size > 0:
-            sample_index = lo + int(hit[0])
+            detected = lo + int(hit[0])
+            # Adaptive MAX_SHIFT: allow up to 100 samples when the previous hit
+            # was far enough away (genuine silence before attack), but cap at 50
+            # when hits are close together to avoid finding valleys in reverb tails.
+            MAX_SHIFT = 100 if (detected - prev_detected) > 8192 else 50
+            LOOKAHEAD = 100
+            peak_start = max(0, detected - 50)
+            peak_end = min(len(fast_env_mono), detected + LOOKAHEAD)
+            peak_abs = peak_start + int(np.argmax(fast_env_mono[peak_start:peak_end]))
+            min_start = max(0, detected - MAX_SHIFT)
+            min_rel = int(np.argmin(fast_env_mono[min_start:peak_abs]))
+            sample_index = min_start + min_rel
+            prev_detected = detected
+            gate_block = int(detected // blockSize)
         else:
             sample_index = lo
+            gate_block = int(lo // blockSize)
         transient_events.append({
             "block": int(sample_index // blockSize),
+            "gate_block": gate_block,
             "sample_offset": int(sample_index % blockSize),
             "sample_index": int(sample_index),
         })

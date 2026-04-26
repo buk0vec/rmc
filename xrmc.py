@@ -24,7 +24,7 @@ from rmcfile import *  # to get access to RMC file handling
 from pcmfile import *  # to get access to WAV file handling
 from simple_run import detectTransients
 from pathlib import Path
-from features import BLOCK_SWITCHING, SHORT_BLOCK_BITBOOST
+from features import BLOCK_SWITCHING, SHORT_BLOCK_BITBOOST, AC2A_BLOCK_SWITCHING
 
 def print_flavor():
     flavor = """
@@ -81,21 +81,28 @@ def Encode(inFilename,
         print(f"\nEncoding {inFilename} -> {codedFilename} at {kbps} kb/s")
 
     if BLOCK_SWITCHING:
-        env_shift = os.getenv("RMC_TRANSIENT_SHIFT_BLOCKS")
-        if transientShiftBlocks is None and env_shift is not None:
-            transientShiftBlocks = int(env_shift)
-
-        if transientShiftBlocks is None:
-            # Dynamic per-transient placement:
-            # p = onset sample offset in detected block (0..1023 for long blocks).
-            # SHORT(-1) captures earlier onsets; SHORT(0) captures later onsets.
-            # Use overlap geometry to choose the block that best centers the attack.
-            events = detectTransients(
-                inFilename,
-                verbose=False,
-                return_events=True,
-                forceBlockSize=nMDCTLines,
-            )
+        events = detectTransients(
+            inFilename,
+            verbose=False,
+            return_events=True,
+            forceBlockSize=nMDCTLines,
+        )
+        if AC2A_BLOCK_SWITCHING:
+            # Exact sample positions — no grid alignment or shift heuristics needed.
+            # Enforce minimum 2048-sample spacing so cascades can never collide.
+            min_spacing = 17 * (nMDCTLines // 8)  # 2176: ensures next transient d >= 1024
+            transient_positions = []
+            last_pos = -min_spacing
+            for e in events:
+                si = int(e["sample_index"])
+                if si - last_pos >= min_spacing:
+                    transient_positions.append(si)
+                    last_pos = si
+            transient_map = {}  # unused in AC2A path
+            if verbose:
+                print(f"TransientDetection: {len(transient_positions)} events (exact positions)")
+        else:
+            # Edler fallback: grid-aligned block-based map with shift heuristic
             transient_map = {}
             n_shift_m1 = 0
             n_shift_0 = 0
@@ -115,30 +122,20 @@ def Encode(inFilename,
                     n_shift_m1 += 1
                 else:
                     n_shift_0 += 1
+            transient_positions = []
             if verbose:
                 print(
-                    f"TransientDetection complete: found transients in {len(transient_map)} blocks "
-                    f"(dynamic shift: -1={n_shift_m1}, 0={n_shift_0})"
-                )
-        else:
-            transient_map = detectTransients(
-                inFilename,
-                verbose=False,
-                forceBlockSize=nMDCTLines,
-            )
-            # Fixed whole-block shift for lookahead experiments and backward compatibility.
-            transient_map = {max(int(x) + transientShiftBlocks, 0): 0 for x in transient_map}
-            if verbose:
-                print(
-                    f"TransientDetection complete: found transients in {len(transient_map)} blocks "
-                    f"(shift={transientShiftBlocks:+d})"
+                    f"TransientDetection: {len(transient_map)} blocks "
+                    f"(shift: -1={n_shift_m1}, 0={n_shift_0})"
                 )
     else:
         transient_map = {}
+        transient_positions = []
         if verbose:
             print("Block switching disabled, using all LONG blocks")
 
     codingParams.transientBlocks = transient_map
+    codingParams.transientPositions = transient_positions
     codingParams.blockIndex = 0
 
     # Adjust targetBitsPerSample so SHORT blocks' boosted budget
