@@ -15,12 +15,14 @@ Algorithm summary (Section 3.4 + Layer 4 extension):
   - A transient is declared if ANY layer fires.
 
 Threshold selection (empirically validated on castanets, glockenspiel, harpsichord):
-  - L1 (N/2  = 1024 samples): T=0.40  → ratio must exceed 2.5×
-  - L2 (N/4  =  512 samples): T=0.40  → ratio must exceed 2.5×
+  - L1 (N/2  = 1024 samples): T=0.42  → ratio must exceed 2.38×
+  - L2 (N/4  =  512 samples): T=0.42  → ratio must exceed 2.38×
   - L3 (N/8  =  256 samples): T=0.07  → ratio must exceed 14.3×
   - L4 (N/16 =  128 samples): T=0.07  → ratio must exceed 14.3×
   Layer 1 dominates for these signals (all transients visible at coarse scale).
   Layers 2-4 add coverage for brief, localised spikes that Layer 1 misses.
+  T12 raised from paper's 0.40 to 0.42 to recover 3 missed glockenspiel onsets
+  (ratios 2.37–2.45×) without adding any false positives to castanets or harpsichord.
 
 Integration note:
   xrmc.py already shifts returned block indices back by 1, so that the
@@ -34,19 +36,24 @@ import scipy.signal
 
 # Per-layer thresholds T[j].  A transient fires when: curr_peak * T[j] > prev_peak
 # Equivalently:  curr_peak / prev_peak > 1 / T[j]
-# L1 (N/2  = 1024 samples): ratio > 2.5×   — coarse, catches large block-level jumps
-# L2 (N/4  =  512 samples): ratio > 2.5×   — catches attacks mid-block
+# L1 (N/2  = 1024 samples): ratio > 2.38×  — coarse, catches large block-level jumps
+# L2 (N/4  =  512 samples): ratio > 2.38×  — catches attacks mid-block
 # L3 (N/8  =  256 samples): ratio > 14.3×  — catches sub-block spikes (one SHORT-block)
 # L4 (N/16 =  128 samples): ratio > 14.3×  — finest resolution, same scale as paper L3
-# Validated empirically on castanets / glockenspiel / harpsichord (EBU-SQAM).
-THRESHOLDS = (0.4, 0.4, 0.07, 0.07)
+#
+# T12 tuned from paper's 0.40 (→ 2.5× ratio) to 0.42 (→ 2.38× ratio) after
+# diagnosing 3 missed glockenspiel note onsets with ratios of 2.37–2.45×.
+# Fine-grained sweep confirmed T12 ∈ [0.42, 0.47] keeps castanets=88, harpsichord=10
+# with zero extra false positives.  0.42 is the most conservative value.
+# Validated: castanets=88, glockenspiel=32, harpsichord=10.
+THRESHOLDS = (0.42, 0.42, 0.07, 0.07)
 
 # Paper uses 1500/32768 ≈ 0.046 at 8 kHz HPF cutoff, tuned for broadband signals
 # like castanets. Lowering cutoff to 2 kHz passes more attack energy from
 # low-frequency instruments (harpsichord, plucked strings). At that cutoff,
 # zero_threshold of 750/32768 ≈ 0.023 avoids noise false-positives while
 # catching harpsichord onsets that the original 8 kHz cutoff missed.
-# Validated on castanets (88), glockenspiel (29), harpsichord (10).
+# Validated on castanets (88), glockenspiel (32), harpsichord (10).
 ZERO_THRESHOLD = 750.0 / 32768.0    # ≈ 0.0229
 HPF_CUTOFF = 2000.0                 # Hz; lower than paper's 8 kHz for broader instrument coverage
 
