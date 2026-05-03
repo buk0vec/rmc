@@ -79,12 +79,26 @@ def _run_with_details(audioPath: str, nMDCTLines: int = 1024, cutoff: float = HP
 
         prev_hp = curr_hp
 
-    # Dual-band detection: union of primary + secondary band
+    # Dual-band detection: union of primary + secondary band (matching detectTransientsSPE)
+    primary_detected = {i for i, f in enumerate(primary_flagged) if f}
     secondary_detected = _run_spe_pass(audio, sr, HPF_CUTOFF2, nMDCTLines,
                                        THRESHOLDS, ZERO_THRESHOLD)
-    transient_blocks = sorted(
-        {i for i, f in enumerate(primary_flagged) if f} | secondary_detected
-    )
+    combined = sorted(primary_detected | secondary_detected)
+
+    # Apply the same targeted dedup as detectTransientsSPE:
+    # suppress block N+1 if block N was secondary-only and N+1 immediately follows.
+    filtered = []
+    skip_next = False
+    for i, b in enumerate(combined):
+        if skip_next:
+            skip_next = False
+            continue
+        filtered.append(b)
+        if (b not in primary_detected
+                and i + 1 < len(combined)
+                and combined[i + 1] == b + 1):
+            skip_next = True
+    transient_blocks = filtered
 
     return (sr, audio, n_blocks, transient_blocks,
             np.array(all_ratios), np.array(all_layer_flags))

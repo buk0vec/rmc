@@ -36,7 +36,7 @@ Dual-band HPF design:
     A block is declared a transient if EITHER band fires.
 
 Validated detection counts (EBU-SQAM + violin):
-  castanets=89  glockenspiel=32  harpsichord=10  violin=30  oboe=6
+  castanets=89  glockenspiel=32  harpsichord=10  violin=28  oboe=5
 
 Note on oboe / fully sustained instruments:
   SPE is a ratio-based detector that requires a significant amplitude jump
@@ -261,13 +261,39 @@ def detectTransientsSPE(audioPath: str,
         audio = audio.mean(axis=1)
 
     # Primary band
-    detected = _run_spe_pass(audio, sr, cutoff, nMDCTLines, thresholds, zero_threshold)
+    primary = _run_spe_pass(audio, sr, cutoff, nMDCTLines, thresholds, zero_threshold)
 
     # Secondary band (union)
     if cutoff2 is not None:
-        detected |= _run_spe_pass(audio, sr, cutoff2, nMDCTLines, thresholds, zero_threshold)
+        secondary = _run_spe_pass(audio, sr, cutoff2, nMDCTLines, thresholds, zero_threshold)
+        combined = sorted(primary | secondary)
 
-    transient_blocks = sorted(detected)
+        # Targeted dedup: suppress double-detections caused by the secondary HPF
+        # pre-detecting a note onset one block early.
+        #
+        # When a note's attack straddles a block boundary, the wider secondary
+        # band (lower cutoff) can fire on block N while the primary band fires on
+        # block N+1 for the same attack.  Rule: if block N was detected by the
+        # secondary band ONLY (not primary), and block N+1 is also detected, then
+        # N+1 is a duplicate — suppress it.
+        #
+        # Pairs where block N is in the PRIMARY band are kept intact: two
+        # consecutive blocks both firing the primary HPF is strong evidence of
+        # genuinely rapid successive events (e.g. rapid castanet strokes).
+        filtered = []
+        skip_next = False
+        for i, b in enumerate(combined):
+            if skip_next:
+                skip_next = False
+                continue
+            filtered.append(b)
+            if (b not in primary                          # secondary-only block
+                    and i + 1 < len(combined)
+                    and combined[i + 1] == b + 1):        # immediately followed
+                skip_next = True
+        transient_blocks = filtered
+    else:
+        transient_blocks = sorted(primary)
 
     if verbose:
         print(f"  SPE blocks ({len(transient_blocks)}): {transient_blocks}")
