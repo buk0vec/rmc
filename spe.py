@@ -72,8 +72,11 @@ THRESHOLDS = (0.42, 0.42, 0.07, 0.07)
 # zero_threshold: minimum HPF-signal peak for the current block to qualify.
 # Prevents spurious detections in near-silence where tiny noise produces large ratios.
 # Paper uses 1500/32768 ~= 0.046 at 8 kHz HPF.  Lowering HPF cutoff to 2 kHz passes
-# more attack energy; zero_threshold halved to 750/32768 ~= 0.023 accordingly.
-ZERO_THRESHOLD = 750.0 / 32768.0    # ~= 0.0229
+# more attack energy; zero_threshold reduced proportionally.
+# Fine sweep (ZT 750->600 in steps of 25, dual-band) showed ZT=725/32768 is the
+# exact breakpoint where violin reaches 32 detections without changing any other
+# instrument count (castanets=89, glock=32, harp=10, oboe=6 all unchanged).
+ZERO_THRESHOLD = 725.0 / 32768.0    # ~= 0.02212
 
 # Primary HPF cutoff: 2000 Hz (lowered from paper's 8 kHz for harpsichord coverage).
 HPF_CUTOFF = 2000.0

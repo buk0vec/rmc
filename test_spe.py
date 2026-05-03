@@ -21,8 +21,11 @@ from spe import (
     detectTransientsSPE,
     spe_block_details,
     _design_highpass,
+    _run_spe_pass,
     THRESHOLDS,
     ZERO_THRESHOLD,
+    HPF_CUTOFF,
+    HPF_CUTOFF2,
 )
 
 INPUT_DIR = os.path.join(os.path.dirname(__file__), 'inputs')
@@ -34,7 +37,7 @@ WAV_FILES = ['castanets.wav', 'glockenspiel.wav', 'harpsichord.wav', 'Van_124.wa
 # Internal helper: re-run SPE while collecting per-block diagnostic data
 # ---------------------------------------------------------------------------
 
-def _run_with_details(audioPath: str, nMDCTLines: int = 1024, cutoff: float = 2000.0):
+def _run_with_details(audioPath: str, nMDCTLines: int = 1024, cutoff: float = HPF_CUTOFF):
     sr, raw = scipy.io.wavfile.read(audioPath)
     if raw.dtype == np.int16:
         audio = raw.astype(np.float64) / 32768.0
@@ -45,6 +48,7 @@ def _run_with_details(audioPath: str, nMDCTLines: int = 1024, cutoff: float = 20
     if audio.ndim == 2:
         audio = audio.mean(axis=1)
 
+    # Primary band: collect per-block ratios for plotting
     sos = _design_highpass(sr, cutoff)
     zi = scipy.signal.sosfilt_zi(sos) * audio[0]
 
@@ -54,9 +58,9 @@ def _run_with_details(audioPath: str, nMDCTLines: int = 1024, cutoff: float = 20
     n_blocks = int(np.ceil(n_samples / half))
 
     prev_hp = np.zeros(half, dtype=np.float64)
-    transient_blocks = []
-    all_ratios = []       # shape (n_blocks, 3)
-    all_layer_flags = []  # shape (n_blocks, 3)
+    primary_flagged = []
+    all_ratios = []       # shape (n_blocks, 4) — from primary band only
+    all_layer_flags = []  # shape (n_blocks, 4)
 
     for block_idx in range(n_blocks):
         start = block_idx * half
@@ -71,10 +75,16 @@ def _run_with_details(audioPath: str, nMDCTLines: int = 1024, cutoff: float = 20
         flagged, ratios, layer_flags = spe_block_details(buf, N)
         all_ratios.append(ratios)
         all_layer_flags.append(layer_flags)
-        if flagged:
-            transient_blocks.append(block_idx)
+        primary_flagged.append(flagged)
 
         prev_hp = curr_hp
+
+    # Dual-band detection: union of primary + secondary band
+    secondary_detected = _run_spe_pass(audio, sr, HPF_CUTOFF2, nMDCTLines,
+                                       THRESHOLDS, ZERO_THRESHOLD)
+    transient_blocks = sorted(
+        {i for i, f in enumerate(primary_flagged) if f} | secondary_detected
+    )
 
     return (sr, audio, n_blocks, transient_blocks,
             np.array(all_ratios), np.array(all_layer_flags))
