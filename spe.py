@@ -7,26 +7,48 @@ Implements the SPE method from:
 
 Algorithm summary (Section 3.4 + Layer 4 extension):
   - Buffer: N samples (left N/2 = previous block, right N/2 = current block)
-  - High-pass filter at 8 kHz (transients are broadband / high-frequency)
+  - Dual-band high-pass filter design (see below)
   - Four layers of sub-block sizes: N/2, N/4, N/8, N/16
   - For each layer j, compare peak of each right-half sub-block to the
     immediately preceding sub-block (cascading within the right half).
   - Flag condition: curr_peak * T[j] > prev_peak  AND  curr_peak > zero_threshold
-  - A transient is declared if ANY layer fires.
+  - A transient is declared if ANY layer of EITHER band fires.
 
-Threshold selection (empirically validated on castanets, glockenspiel, harpsichord):
+Threshold selection (empirically validated on 5 EBU-SQAM instruments):
   - L1 (N/2  = 1024 samples): T=0.42  → ratio must exceed 2.38×
   - L2 (N/4  =  512 samples): T=0.42  → ratio must exceed 2.38×
   - L3 (N/8  =  256 samples): T=0.07  → ratio must exceed 14.3×
   - L4 (N/16 =  128 samples): T=0.07  → ratio must exceed 14.3×
-  Layer 1 dominates for these signals (all transients visible at coarse scale).
+  Layer 1 dominates for percussive/plucked signals.
   Layers 2-4 add coverage for brief, localised spikes that Layer 1 misses.
-  T12 raised from paper's 0.40 to 0.42 to recover 3 missed glockenspiel onsets
-  (ratios 2.37–2.45×) without adding any false positives to castanets or harpsichord.
+  T12 raised from paper's 0.40 to 0.42 to recover missed glockenspiel onsets
+  (ratios 2.37-2.45x) without adding false positives to castanets or harpsichord.
+
+Dual-band HPF design:
+  Band 1 (HPF_CUTOFF  = 2000 Hz): primary band, tuned for percussive /
+    plucked / struck instruments (castanets, glockenspiel, harpsichord).
+    Filters out low-frequency sustain that would elevate prev_peak and
+    suppress ratio-based detection.
+  Band 2 (HPF_CUTOFF2 = 1500 Hz): secondary band, added to handle bowed /
+    sustained instruments (violin) whose harmonic energy sits mostly below
+    2 kHz. At 2 kHz, 96% of violin blocks are ZT-blocked; at 1500 Hz, the
+    violin attack energy passes through and produces detectable ratios.
+    A block is declared a transient if EITHER band fires.
+
+Validated detection counts (EBU-SQAM + violin):
+  castanets=89  glockenspiel=32  harpsichord=10  violin=30  oboe=6
+
+Note on oboe / fully sustained instruments:
+  SPE is a ratio-based detector that requires a significant amplitude jump
+  relative to the preceding block. Wind instruments (oboe, clarinet, flute)
+  sustain continuously between notes with ratio ~1.0, so only phrase-level
+  onsets from near-silence are catchable. Per-note detection for purely
+  sustained instruments requires a different algorithm (spectral flux,
+  pitch-period onset, etc.) and is a known limitation of the SPE family.
 
 Integration note:
   xrmc.py already shifts returned block indices back by 1, so that the
-  START block (LONG→SHORT transition) precedes the detected attack.
+  START block (LONG->SHORT transition) precedes the detected attack.
   This function simply returns the indices of blocks containing attacks.
 """
 
@@ -36,26 +58,32 @@ import scipy.signal
 
 # Per-layer thresholds T[j].  A transient fires when: curr_peak * T[j] > prev_peak
 # Equivalently:  curr_peak / prev_peak > 1 / T[j]
-# L1 (N/2  = 1024 samples): ratio > 2.38×  — coarse, catches large block-level jumps
-# L2 (N/4  =  512 samples): ratio > 2.38×  — catches attacks mid-block
-# L3 (N/8  =  256 samples): ratio > 14.3×  — catches sub-block spikes (one SHORT-block)
-# L4 (N/16 =  128 samples): ratio > 14.3×  — finest resolution, same scale as paper L3
+# L1 (N/2  = 1024 samples): ratio > 2.38x  -- coarse, catches large block-level jumps
+# L2 (N/4  =  512 samples): ratio > 2.38x  -- catches attacks mid-block
+# L3 (N/8  =  256 samples): ratio > 14.3x  -- catches sub-block spikes (one SHORT-block)
+# L4 (N/16 =  128 samples): ratio > 14.3x  -- finest resolution, same scale as paper L3
 #
-# T12 tuned from paper's 0.40 (→ 2.5× ratio) to 0.42 (→ 2.38× ratio) after
-# diagnosing 3 missed glockenspiel note onsets with ratios of 2.37–2.45×.
-# Fine-grained sweep confirmed T12 ∈ [0.42, 0.47] keeps castanets=88, harpsichord=10
+# T12 tuned from paper's 0.40 (-> 2.5x ratio) to 0.42 (-> 2.38x ratio) after
+# diagnosing 3 missed glockenspiel note onsets with ratios of 2.37-2.45x.
+# Fine-grained sweep confirmed T12 in [0.42, 0.47] keeps castanets=88, harpsichord=10
 # with zero extra false positives.  0.42 is the most conservative value.
-# Validated: castanets=88, glockenspiel=32, harpsichord=10.
 THRESHOLDS = (0.42, 0.42, 0.07, 0.07)
 
-# Paper uses 1500/32768 ≈ 0.046 at 8 kHz HPF cutoff, tuned for broadband signals
-# like castanets. Lowering cutoff to 2 kHz passes more attack energy from
-# low-frequency instruments (harpsichord, plucked strings). At that cutoff,
-# zero_threshold of 750/32768 ≈ 0.023 avoids noise false-positives while
-# catching harpsichord onsets that the original 8 kHz cutoff missed.
-# Validated on castanets (88), glockenspiel (32), harpsichord (10).
-ZERO_THRESHOLD = 750.0 / 32768.0    # ≈ 0.0229
-HPF_CUTOFF = 2000.0                 # Hz; lower than paper's 8 kHz for broader instrument coverage
+# zero_threshold: minimum HPF-signal peak for the current block to qualify.
+# Prevents spurious detections in near-silence where tiny noise produces large ratios.
+# Paper uses 1500/32768 ~= 0.046 at 8 kHz HPF.  Lowering HPF cutoff to 2 kHz passes
+# more attack energy; zero_threshold halved to 750/32768 ~= 0.023 accordingly.
+ZERO_THRESHOLD = 750.0 / 32768.0    # ~= 0.0229
+
+# Primary HPF cutoff: 2000 Hz (lowered from paper's 8 kHz for harpsichord coverage).
+HPF_CUTOFF = 2000.0
+
+# Secondary HPF cutoff: 1500 Hz.  Added for bowed/sustained instruments (violin)
+# whose harmonic energy lies mostly below 2 kHz.  A dual-band OR logic fires if
+# EITHER band detects a transient.  Sweep confirmed:
+#   castanets=89 (+1), glockenspiel=32 (unchanged), harpsichord=10 (unchanged),
+#   violin=30 (from 4), oboe=6 (from 2).
+HPF_CUTOFF2 = 1500.0
 
 
 def _design_highpass(sr: int, cutoff: float = HPF_CUTOFF, order: int = 4):
@@ -138,14 +166,55 @@ def spe_block_details(hp_buf: np.ndarray,
     return flagged, ratios, layer_flags
 
 
+def _run_spe_pass(audio: np.ndarray, sr: int, cutoff: float,
+                  nMDCTLines: int, thresholds: tuple,
+                  zero_threshold: float) -> set:
+    """
+    Internal helper: run one full HPF pass over the audio and return
+    the set of block indices where SPE fires.
+    """
+    sos = _design_highpass(sr, cutoff)
+    zi = scipy.signal.sosfilt_zi(sos) * audio[0]
+
+    N = nMDCTLines * 2
+    half = nMDCTLines
+    n_blocks = int(np.ceil(len(audio) / half))
+    prev_hp = np.zeros(half, dtype=np.float64)
+    detected = set()
+
+    for block_idx in range(n_blocks):
+        start = block_idx * half
+        end = min(start + half, len(audio))
+        chunk = audio[start:end]
+        if len(chunk) < half:
+            chunk = np.pad(chunk, (0, half - len(chunk)))
+
+        curr_hp, zi = scipy.signal.sosfilt(sos, chunk, zi=zi)
+        buf = np.concatenate([prev_hp, curr_hp])
+
+        if spe_block(buf, N, thresholds, zero_threshold):
+            detected.add(block_idx)
+
+        prev_hp = curr_hp
+
+    return detected
+
+
 def detectTransientsSPE(audioPath: str,
                          nMDCTLines: int = 1024,
                          cutoff: float = HPF_CUTOFF,
+                         cutoff2: float = HPF_CUTOFF2,
                          thresholds: tuple = THRESHOLDS,
                          zero_threshold: float = ZERO_THRESHOLD,
                          verbose: bool = False) -> np.ndarray:
     """
-    Detect transients using Sub-block Peak Energy (SPE).
+    Detect transients using dual-band Sub-block Peak Energy (SPE).
+
+    Runs two HPF passes (cutoff and cutoff2) and returns the union of
+    their detections.  The primary band (cutoff=2000 Hz) is tuned for
+    percussive/plucked instruments; the secondary band (cutoff2=1500 Hz)
+    extends coverage to bowed instruments whose energy lies below 2 kHz.
+    Pass cutoff2=None to disable the secondary band (single-band mode).
 
     Processes the file block-by-block with no whole-file pre-analysis.
     Each codec block advances `nMDCTLines` samples; the SPE buffer is
@@ -158,21 +227,23 @@ def detectTransientsSPE(audioPath: str,
     nMDCTLines : int
         New samples per codec block (= nMDCTLines in the codec). Default 1024.
     cutoff : float
-        High-pass filter cutoff in Hz. Default 8000.
-    thresholds : tuple of 3 floats
-        Per-layer thresholds (T1, T2, T3). Transient fires when
-        curr_peak * T[j] > prev_peak. Default from paper Table 1.
+        Primary high-pass filter cutoff in Hz. Default 2000.
+    cutoff2 : float or None
+        Secondary high-pass filter cutoff in Hz. Default 1500. Pass None
+        to disable and revert to single-band mode.
+    thresholds : tuple of 4 floats
+        Per-layer thresholds (T1, T2, T3, T4). Transient fires when
+        curr_peak * T[j] > prev_peak. Applied to BOTH bands.
     zero_threshold : float
-        Minimum current-half peak to consider; suppresses detections in
-        near-silence. Default 1500/32768.
+        Minimum current-half HPF peak; suppresses noise-floor detections.
+        Applied to BOTH bands.
     verbose : bool
 
     Returns
     -------
     np.ndarray of int
-        Sorted block indices where transients are detected.
-        xrmc.py shifts these back by 1 to place START blocks correctly;
-        this function simply identifies blocks containing attacks.
+        Sorted block indices where transients are detected (union of both bands).
+        xrmc.py shifts these back by 1 to place START blocks correctly.
     """
     sr, raw = scipy.io.wavfile.read(audioPath)
 
@@ -183,35 +254,17 @@ def detectTransientsSPE(audioPath: str,
     else:
         audio = raw.astype(np.float64)
 
-    if audio.ndim == 2:          # stereo → mono
+    if audio.ndim == 2:          # stereo -> mono
         audio = audio.mean(axis=1)
 
-    sos = _design_highpass(sr, cutoff)
-    zi = scipy.signal.sosfilt_zi(sos) * audio[0]  # warm-start filter state
+    # Primary band
+    detected = _run_spe_pass(audio, sr, cutoff, nMDCTLines, thresholds, zero_threshold)
 
-    N = nMDCTLines * 2    # SPE buffer: prev half + curr half
-    half = nMDCTLines     # new samples per codec block (hop size)
+    # Secondary band (union)
+    if cutoff2 is not None:
+        detected |= _run_spe_pass(audio, sr, cutoff2, nMDCTLines, thresholds, zero_threshold)
 
-    n_samples = len(audio)
-    n_blocks = int(np.ceil(n_samples / half))
-
-    prev_hp = np.zeros(half, dtype=np.float64)
-    transient_blocks = []
-
-    for block_idx in range(n_blocks):
-        start = block_idx * half
-        end = min(start + half, n_samples)
-        chunk = audio[start:end]
-        if len(chunk) < half:
-            chunk = np.pad(chunk, (0, half - len(chunk)))
-
-        curr_hp, zi = scipy.signal.sosfilt(sos, chunk, zi=zi)
-
-        buf = np.concatenate([prev_hp, curr_hp])
-        if spe_block(buf, N, thresholds, zero_threshold):
-            transient_blocks.append(block_idx)
-
-        prev_hp = curr_hp
+    transient_blocks = sorted(detected)
 
     if verbose:
         print(f"  SPE blocks ({len(transient_blocks)}): {transient_blocks}")

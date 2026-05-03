@@ -26,7 +26,8 @@ from spe import (
 )
 
 INPUT_DIR = os.path.join(os.path.dirname(__file__), 'inputs')
-WAV_FILES = ['castanets.wav', 'glockenspiel.wav', 'harpsichord.wav','Van_124.wav']
+WAV_FILES = ['castanets.wav', 'glockenspiel.wav', 'harpsichord.wav', 'Van_124.wav',
+             'oboe.wav', 'violin.wav']
 
 
 # ---------------------------------------------------------------------------
