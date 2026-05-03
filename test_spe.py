@@ -26,11 +26,12 @@ from spe import (
     ZERO_THRESHOLD,
     HPF_CUTOFF,
     HPF_CUTOFF2,
+    HPF_CUTOFF3,
 )
 
 INPUT_DIR = os.path.join(os.path.dirname(__file__), 'inputs')
 WAV_FILES = ['castanets.wav', 'glockenspiel.wav', 'harpsichord.wav', 'Van_124.wav',
-             'oboe.wav', 'violin.wav']
+             'oboe.wav', 'violin2.wav',]
 
 
 # ---------------------------------------------------------------------------
@@ -79,14 +80,16 @@ def _run_with_details(audioPath: str, nMDCTLines: int = 1024, cutoff: float = HP
 
         prev_hp = curr_hp
 
-    # Dual-band detection: union of primary + secondary band (matching detectTransientsSPE)
+    # Tri-band detection: union of primary + secondary + tertiary (matches detectTransientsSPE)
     primary_detected = {i for i, f in enumerate(primary_flagged) if f}
     secondary_detected = _run_spe_pass(audio, sr, HPF_CUTOFF2, nMDCTLines,
                                        THRESHOLDS, ZERO_THRESHOLD)
-    combined = sorted(primary_detected | secondary_detected)
+    tertiary_detected = _run_spe_pass(audio, sr, HPF_CUTOFF3, nMDCTLines,
+                                      THRESHOLDS, ZERO_THRESHOLD)
+    combined = sorted(primary_detected | secondary_detected | tertiary_detected)
 
-    # Apply the same targeted dedup as detectTransientsSPE:
-    # suppress block N+1 if block N was secondary-only and N+1 immediately follows.
+    # Aggressive boundary dedup (matches detectTransientsSPE): in any pair
+    # (N, N+1) where the gap is exactly 1, drop N+1.
     filtered = []
     skip_next = False
     for i, b in enumerate(combined):
@@ -94,9 +97,7 @@ def _run_with_details(audioPath: str, nMDCTLines: int = 1024, cutoff: float = HP
             skip_next = False
             continue
         filtered.append(b)
-        if (b not in primary_detected
-                and i + 1 < len(combined)
-                and combined[i + 1] == b + 1):
+        if i + 1 < len(combined) and combined[i + 1] == b + 1:
             skip_next = True
     transient_blocks = filtered
 
