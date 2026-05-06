@@ -312,13 +312,14 @@ def MediumTransWindowFunc(a, b):
     return w
 
 
-def plan_cascade(k_attack):
+def plan_cascade(k_attack, halfN_short=64):
     """
-    Returns the list of MEDIUM lead blocks for a given k_attack (0..7).
-    k=0 → no MEDIUM; START(128) → SHORT directly.
-    k≥1 → one MEDIUM(k*128 → 128).
+    Returns the list of MEDIUM lead blocks for a given k_attack (0..15).
+    k=0 → b_start=15*halfN_short; k=15 → b_start=30*halfN_short.
+    MEDIUM left overlap must equal START right overlap (= b_start).
     """
-    return [((7 + k_attack) * 128, 128)]
+    b = (15 + k_attack) * halfN_short
+    return [(b, halfN_short)]
 
 
 _sfbands_cache = {}
@@ -332,6 +333,8 @@ def DesignSFBands(nLines, sampleRate, min_lines=4, max_lines=100):
     Falls through to the hand-tuned tables for the standard 128-line SHORT and
     576-line transition blocks.
     """
+    if nLines == 64:
+        return ShortBlockSFBands(64, sampleRate)
     if nLines == 128:
         return ShortBlockSFBands(128, sampleRate)
     if nLines == 576 and sampleRate == 44100:
@@ -450,11 +453,15 @@ def ShortBlockSFBands(nMDCTLines_short, sampleRate):
     Returns:
         ScaleFactorBands object appropriate for short-block encoding
     """
-    # Perceptually-motivated 12-band table for 128 MDCT lines at 44100 Hz.
-    # Bands 0-8 match the AAC table (0-9647 Hz, ~1-6 Bark each).
-    # Bands 9-11 collapse the original 5 ultra-high-freq bands (each only 0.2-0.8 Bark)
-    # into 3 bands of ~1 Bark each — reducing overhead without losing audible resolution.
-    nLines = np.array([4, 4, 4, 4, 4, 8, 8, 8, 12, 16, 24, 32])
+    if nMDCTLines_short == 128:
+        # 12-band table for 128 MDCT lines at 44100 Hz (256-sample SHORT window).
+        nLines = np.array([4, 4, 4, 4, 4, 8, 8, 8, 12, 16, 24, 32])
+    else:
+        # 5-band Bark-derived table for 64 MDCT lines at 44100 Hz (128-sample SHORT window).
+        # Each line = 22050/64 ≈ 344 Hz. Bark merge with min 8 lines/band.
+        # 10 bands consumed 60% of the 96 kbps SHORT budget; 5 bands → 31% overhead,
+        # giving 1.50 bits/line vs 0.88 with 10 bands (matches 256-sample SHORT performance).
+        nLines = np.array([8, 8, 12, 17, 19])
 
     return ScaleFactorBands(nLines)
 

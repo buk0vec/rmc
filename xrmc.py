@@ -23,6 +23,7 @@ import os
 from rmcfile import *  # to get access to RMC file handling
 from pcmfile import *  # to get access to WAV file handling
 from simple_run import detectTransients
+from spe import detectTransientsSPESamples
 from pathlib import Path
 from features import BLOCK_SWITCHING, SHORT_BLOCK_BITBOOST, AC2A_BLOCK_SWITCHING
 
@@ -81,21 +82,26 @@ def Encode(inFilename,
         print(f"\nEncoding {inFilename} -> {codedFilename} at {kbps} kb/s")
 
     if BLOCK_SWITCHING:
-        events = detectTransients(
-            inFilename,
-            verbose=False,
-            return_events=True,
-            forceBlockSize=nMDCTLines,
-        )
+        if AC2A_BLOCK_SWITCHING:
+            events = detectTransientsSPESamples(inFilename, nMDCTLines=nMDCTLines, verbose=verbose)
+        else:
+            events = detectTransients(
+                inFilename,
+                verbose=False,
+                return_events=True,
+                forceBlockSize=nMDCTLines,
+            )
         if AC2A_BLOCK_SWITCHING:
             # Exact sample positions — no grid alignment or shift heuristics needed.
             # Enforce minimum 2048-sample spacing so cascades can never collide.
-            min_spacing = 17 * (nMDCTLines // 8)  # 2176: ensures next transient d >= 1024
+            # min cascade = (15+0)*halfN_short + halfN_short + halfN_short + halfN
+            #             = 17*halfN_short + halfN  (halfN_short = nMDCTLines//16)
+            min_spacing = 17 * (nMDCTLines // 16) + nMDCTLines  # 2112 samples
             transient_positions = []
             last_pos = -min_spacing
             for e in events:
                 si = int(e["sample_index"])
-                if si - last_pos >= min_spacing:
+                if si - last_pos >= min_spacing and si >= nMDCTLines:
                     transient_positions.append(si)
                     last_pos = si
             transient_map = {}  # unused in AC2A path

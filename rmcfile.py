@@ -13,7 +13,7 @@ from bitpack import *  # class for packing data into an array of bytes where eac
 import codec    # module where the actual PAC coding functions reside(this module only specifies the PAC file format)
 from psychoac import ScaleFactorBands, AssignMDCTLinesFromFreqLimits  # defines the grouping of MDCT lines into scale factor bands
 from entropy import BlockEntropyCoder, RawMantissaCoder
-from features import ENTROPY_CODING, VARIABLE_BIT_RATE, MID_SIDE_CODING, PREDICTION, SUBBASS_HYBRID, TNS, AC2A_BLOCK_SWITCHING, ADAPTIVE_CASCADE
+from features import ENTROPY_CODING, VARIABLE_BIT_RATE, MID_SIDE_CODING, PREDICTION, SUBBASS_HYBRID, TNS, AC2A_BLOCK_SWITCHING, ADAPTIVE_CASCADE, K_ATTACK_MAX
 import bisect
 from blockswitching import LONG, START, SHORT, STOP, MEDIUM, N_SHORT_BLOCKS, ShortBlockSFBands, TransitionSFBands, WindowForBlockType, SelectBlockType, mask_to_group_lens, plan_cascade, DesignSFBands
 from mdct import MDCT, IMDCT
@@ -59,10 +59,10 @@ class RMCFile(AudioFile):
         myParams.nScaleBits = nScaleBits
         myParams.nMantSizeBits = nMantSizeBits
         #short block switching additions
-        myParams.nMDCTLines_short = nMDCTLines // 8
+        myParams.nMDCTLines_short = nMDCTLines // 16
         myParams.sfBands_short = ShortBlockSFBands(myParams.nMDCTLines_short, sampleRate)
         if AC2A_BLOCK_SWITCHING:
-            _nMDCTLines_trans = (nMDCTLines + nMDCTLines // 8) // 2
+            _nMDCTLines_trans = (nMDCTLines + nMDCTLines // 16) // 2
             myParams.nMDCTLines_trans = _nMDCTLines_trans
             myParams.sfBands_trans = TransitionSFBands(_nMDCTLines_trans, sampleRate)
         myParams.prevBlockType = LONG
@@ -133,10 +133,10 @@ class RMCFile(AudioFile):
 
             codingParams.blockType = pb.ReadBits(3)
             if AC2A_BLOCK_SWITCHING and codingParams.blockType == START:
-                k_attack_read = pb.ReadBits(3)
+                k_attack_read = pb.ReadBits(4)
                 codingParams.k_attack_for_stop = k_attack_read
-                b_start = (7 + k_attack_read) * halfN_short  # recover exact b_start
-                medium_lead = plan_cascade(k_attack_read)
+                b_start = (15 + k_attack_read) * halfN_short  # recover exact b_start
+                medium_lead = plan_cascade(k_attack_read, halfN_short)
                 codingParams.cascade_a = halfN
                 codingParams.cascade_b = b_start
                 # Queue only lead MEDIUMs; STOP is always standard (cascade_a=128)
@@ -398,7 +398,7 @@ class RMCFile(AudioFile):
                                 )
         codingParams.sfBands=sfBands
         #short block switching additions
-        codingParams.nMDCTLines_short = codingParams.nMDCTLines // 8
+        codingParams.nMDCTLines_short = codingParams.nMDCTLines // 16
         codingParams.sfBands_short = ShortBlockSFBands(codingParams.nMDCTLines_short, codingParams.sampleRate)
         if AC2A_BLOCK_SWITCHING:
             _nMDCTLines_trans = (codingParams.nMDCTLines + codingParams.nMDCTLines_short) // 2
@@ -410,9 +410,10 @@ class RMCFile(AudioFile):
             _positions0 = getattr(codingParams, 'transientPositions', [])
             if _positions0:
                 _raw0 = _positions0[0]
-                _k0 = max(0, min(7, (_raw0 - codingParams.nMDCTLines) // codingParams.nMDCTLines_short))
-                _bs0 = (7 + _k0) * codingParams.nMDCTLines_short
-                codingParams.nSamplesPerBlock = _bs0
+                if _raw0 < 2 * codingParams.nMDCTLines:
+                    _k0 = max(0, min(K_ATTACK_MAX, (_raw0 - codingParams.nMDCTLines) // codingParams.nMDCTLines_short))
+                    _bs0 = (15 + _k0) * codingParams.nMDCTLines_short
+                    codingParams.nSamplesPerBlock = _bs0
         codingParams.blockType = LONG
         codingParams.block_queue = []
         codingParams.cascade_a = codingParams.nMDCTLines
@@ -479,8 +480,8 @@ class RMCFile(AudioFile):
             _tidx = bisect.bisect_left(_positions, _pos)
             if _tidx < len(_positions) and _positions[_tidx] < _pos + 2 * halfN:
                 _raw_offset = _positions[_tidx] - _pos
-                _k_encoded = max(0, min(7, (_raw_offset - halfN) // halfN_short))
-                _b_start = (7 + _k_encoded) * halfN_short
+                _k_encoded = max(0, min(K_ATTACK_MAX, (_raw_offset - halfN) // halfN_short))
+                _b_start = (15 + _k_encoded) * halfN_short
                 k_attack = _k_encoded
             else:
                 _b_start = halfN_short
@@ -498,7 +499,7 @@ class RMCFile(AudioFile):
             elif _prev in (LONG, STOP):
                 if k_attack >= 0:
                     _bt = START
-                    medium_lead = plan_cascade(_k_encoded)
+                    medium_lead = plan_cascade(_k_encoded, halfN_short)
                     codingParams.cascade_a = halfN
                     codingParams.cascade_b = _b_start
                     for (ma, mb) in medium_lead:
@@ -722,7 +723,7 @@ class RMCFile(AudioFile):
         for iCh in range(codingParams.nChannels):
             oh = 32 + 3 + 2  # nBytes field (4 bytes) + 3-bit block type + pred type
             if AC2A_BLOCK_SWITCHING and current_block_type == START:
-                oh += 3  # k_attack field
+                oh += 4  # k_attack field (4 bits: k range 0-15)
             if iCh == 0 and codingParams.nChannels == 2:
                 oh += 1  # M/S flag
             if ranges[iCh] is not None:
@@ -855,7 +856,7 @@ class RMCFile(AudioFile):
             entropy_pbs = []
             nBits = 5  # 3 bits block type + 2 bits prediction type
             if AC2A_BLOCK_SWITCHING and codingParams.blockType == START:
-                nBits += 3  # k_attack field
+                nBits += 4  # k_attack field
             if iCh == 0 and codingParams.nChannels == 2:
                 nBits += 1  # M/S flag
             if ranges[iCh] is not None:
@@ -974,7 +975,7 @@ class RMCFile(AudioFile):
             pb.Size(nBytes)
             pb.WriteBits(codingParams.blockType, 3)
             if AC2A_BLOCK_SWITCHING and codingParams.blockType == START:
-                pb.WriteBits(codingParams.k_attack_for_stop, 3)
+                pb.WriteBits(codingParams.k_attack_for_stop, 4)
             if SUBBASS_HYBRID and codingParams.blockType == LONG:
                 pb.WriteBits(1 if is_adjacent_long else 0, 1)
             pb.WriteBits(PRED_MAP[ranges[iCh]], 2)
@@ -1066,8 +1067,8 @@ class RMCFile(AudioFile):
             _tidx_next = bisect.bisect_left(_positions, _pos_next)
             if _tidx_next < len(_positions) and _positions[_tidx_next] < _pos_next + 2 * halfN:
                 _raw_next = _positions[_tidx_next] - _pos_next
-                _k_next = max(0, min(7, (_raw_next - halfN) // halfN_short))
-                _b_next = (7 + _k_next) * halfN_short
+                _k_next = max(0, min(K_ATTACK_MAX, (_raw_next - halfN) // halfN_short))
+                _b_next = (15 + _k_next) * halfN_short
                 _k_next_valid = True
             else:
                 _b_next = halfN
