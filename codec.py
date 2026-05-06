@@ -16,7 +16,7 @@ from quantize import *  # using vectorized versions (to use normal versions, unc
 # used only by Encode
 from psychoac import CalcSMRs  # calculates SMRs for each scale factor band
 from bitalloc import BitAlloc  #allocates bits to scale factor bands given SMRs
-from blockswitching import WindowForBlockType, LONG, SHORT, N_SHORT_BLOCKS
+from blockswitching import WindowForBlockType, SHORT, N_SHORT_BLOCKS
 
 def Decode(scaleFactor,bitAlloc,mantissa,overallScaleFactor,codingParams,mdct_pred=None):
     """Reconstitutes a single-channel block of encoded data into a block of
@@ -136,10 +136,8 @@ def EncodeSingleChannel(data,codingParams):
         sub_mdct_scaled = []
         sub_ovs = []
         sub_smrs = []
-        sub_time = []
         for i in range(N_SHORT_BLOCKS):
             timeSamples = data[pad + i*halfN : pad + i*halfN + N]
-            sub_time.append(timeSamples)
             mdctTimeSamples = WindowForBlockType(codingParams.blockType, N_long, N_short) * timeSamples
             mdctLines = MDCT(mdctTimeSamples, halfN, halfN)[:halfN]
 

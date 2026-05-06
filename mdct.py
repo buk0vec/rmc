@@ -39,13 +39,14 @@ def MDCTslow(data, a, b, isInverse=False):
     ### YOUR CODE ENDS HERE ###
 
 ### Problem 1.c ###
-def MDCT(data, a, b, isInverse=False):
+def MDCT(data, a, b, isInverse=False, return_complex=False):
     """
     Fast MDCT algorithm for window length a+b following pp. 141-143 of
     Bosi & Goldberg, "Introduction to Digital Audio..." book
     and where the 2/N factor is included in forward transform instead of inverse.
     a: left half-window length
     b: right half-window length
+    return_complex: if True, return complex array where real=MDCT, imag=MDST (exact, no FIR approx)
     """
 
     ### YOUR CODE STARTS HERE ###
@@ -58,6 +59,9 @@ def MDCT(data, a, b, isInverse=False):
     out = scipy.fft.fft(out, norm="forward")
     post_twiddles = np.exp(-1j * 2 * np.pi / N * n_0 * (ks + 0.5))
     out = out[:N // 2] * post_twiddles
+    if return_complex:
+        # out = (1/2)*(MDCT - j*MDST), so MDCT+j*MDST = 2*conj(out)
+        return out.real * 2 + 1j * (-out.imag * 2)
     return out.real * 2
     ### YOUR CODE ENDS HERE ###
 

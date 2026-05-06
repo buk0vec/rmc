@@ -49,7 +49,7 @@ def print_flavor():
 def Encode(inFilename,
             codedFilename=None,
             nMDCTLines=1024,
-            nScaleBits=3,
+            nScaleBits=5,
             nMantSizeBits=5,
             kbps=128,
             targetBitsPerSample=None,
@@ -112,7 +112,6 @@ def Encode(inFilename,
     
     # open the output file
     outFile.OpenForWriting(codingParams)  # (includes writing header)
-
     # Read the input file and pass its data to the output file to be written
     total_samples = codingParams.numSamples
     processed_samples = 0
