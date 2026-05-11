@@ -9,7 +9,7 @@ codec.py -- The actual encode/decode functions for the perceptual audio codec
 import numpy as np  # used for arrays
 
 from bitalloc import BitAlloc  # allocates bits to scale factor bands given SMRs
-from blockswitching import N_SHORT_BLOCKS, SHORT, WindowForBlockType
+from blockswitching import LONG, N_SHORT_BLOCKS, SHORT, START, STOP, MEDIUM, DesignSFBands, WindowForBlockType
 from features import RMCFeatures
 
 # used by Encode and Decode
@@ -21,20 +21,85 @@ from quantize import *  # using vectorized versions (to use normal versions, unc
 
 
 def Decode(
-    scaleFactor, bitAlloc, mantissa, overallScaleFactor, codingParams, mdct_pred=None
+    scaleFactor, bitAlloc, mantissa, overallScaleFactor, codingParams, mdct_pred=None,
+    features: RMCFeatures = None,
 ):
     """Reconstitutes a single-channel block of encoded data into a block of
     signed-fraction data based on the parameters in a PACFile object"""
-
+    if features is None:
+        features = RMCFeatures()
     halfN_long = codingParams.nMDCTLines
     N_long = 2 * halfN_long
     halfN_short = codingParams.nMDCTLines_short
     N_short = 2 * halfN_short
     sfBands_short = codingParams.sfBands_short
-    # reconstitute the first halfN MDCT lines of this channel from the stored data
-    if codingParams.blockType == SHORT:
-        # Decode 8 short sub-blocks, window each, and overlap-add into a long-block-sized
-        # output buffer. The 'pad' centers the short blocks within the long block window.
+
+    if codingParams.blockType == SHORT and features.AC2A_BLOCK_SWITCHING:
+        # AC-2A: single 256-sample SHORT sub-block
+        rescaleLevel = 1.*(1<<overallScaleFactor)
+        mdctLine = np.zeros(halfN_short, dtype=np.float64)
+        iMant = 0
+        for iBand in range(sfBands_short.nBands):
+            nLines = sfBands_short.nLines[iBand]
+            if bitAlloc[iBand]:
+                mdctLine[iMant:iMant+nLines] = vDequantize(
+                    scaleFactor[iBand], mantissa[iMant:iMant+nLines],
+                    codingParams.nScaleBits, bitAlloc[iBand])
+            iMant += nLines
+        mdctLine /= rescaleLevel
+        return WindowForBlockType(SHORT, N_long, N_short) * IMDCT(mdctLine, halfN_short, halfN_short)
+
+    elif codingParams.blockType == MEDIUM and features.AC2A_BLOCK_SWITCHING:
+        # Cascade intermediate block: IMDCT with variable (a, b) overlap sizes
+        ca = codingParams.cascade_a   # left overlap
+        cb = codingParams.cascade_b   # right overlap
+        halfN_med = (ca + cb) // 2
+        sfBands_med = DesignSFBands(halfN_med, codingParams.sampleRate)
+        rescaleLevel = 1.*(1<<overallScaleFactor)
+        mdctLine = np.zeros(halfN_med, dtype=np.float64)
+        iMant = 0
+        for iBand in range(sfBands_med.nBands):
+            nLines = sfBands_med.nLines[iBand]
+            if bitAlloc[iBand]:
+                mdctLine[iMant:iMant+nLines] = vDequantize(
+                    scaleFactor[iBand], mantissa[iMant:iMant+nLines],
+                    codingParams.nScaleBits, bitAlloc[iBand])
+            iMant += nLines
+        mdctLine /= rescaleLevel
+        return WindowForBlockType(MEDIUM, N_long, N_short,
+                                  cascade_a=ca, cascade_b=cb) * IMDCT(mdctLine, ca, cb)
+
+    elif codingParams.blockType in (START, STOP) and features.AC2A_BLOCK_SWITCHING:
+        # AC-2A: asymmetric transition block (b may vary for cascade START*)
+        ca = getattr(codingParams, 'cascade_a', halfN_long)
+        cb = getattr(codingParams, 'cascade_b', halfN_short)
+        halfN_trans = (ca + cb) // 2
+        sfBands_trans = DesignSFBands(halfN_trans, codingParams.sampleRate) \
+            if halfN_trans != getattr(codingParams, 'nMDCTLines_trans', halfN_trans) \
+            else codingParams.sfBands_trans
+        rescaleLevel = 1.*(1<<overallScaleFactor)
+        mdctLine = np.zeros(halfN_trans, dtype=np.float64)
+        iMant = 0
+        for iBand in range(sfBands_trans.nBands):
+            nLines = sfBands_trans.nLines[iBand]
+            if bitAlloc[iBand]:
+                mdctLine[iMant:iMant+nLines] = vDequantize(
+                    scaleFactor[iBand], mantissa[iMant:iMant+nLines],
+                    codingParams.nScaleBits, bitAlloc[iBand])
+            iMant += nLines
+        mdctLine /= rescaleLevel
+        if mdct_pred is not None:
+            mdctLine += mdct_pred
+        if codingParams.blockType == START:
+            data = WindowForBlockType(START, N_long, N_short,
+                                      cascade_b=cb) * IMDCT(mdctLine, ca, cb)
+        else:
+            data = WindowForBlockType(STOP, N_long, N_short,
+                                      cascade_a=ca) * IMDCT(mdctLine, ca, cb)
+        return data
+
+    elif codingParams.blockType == SHORT:
+        # Edler: 8 sub-blocks assembled into N_long output
         N = N_short
         halfN = halfN_short
         pad = N_long // 4 - N_short // 4
@@ -86,7 +151,7 @@ def Decode(
                     bitAlloc[iBand],
                 )
             iMant += nLines
-        mdctLine /= rescaleLevel  # put overall gain back to original level
+        mdctLine /= rescaleLevel
         if mdct_pred is not None:
             mdctLine += mdct_pred
         # IMDCT and window the data for this channel
@@ -121,7 +186,6 @@ def Encode(data, codingParams, features: RMCFeatures):
     bitAlloc = []
     mantissa = []
     overallScaleFactor = []
-
     # loop over channels and separately encode each one
     for iCh in range(codingParams.nChannels):
         codingParams._masking_signal = (
@@ -165,7 +229,149 @@ def EncodeSingleChannel(data, codingParams, features: RMCFeatures):
         maxMantBits = 16  # to make sure we don't ever overflow mantissa holders
     sfBands_long = codingParams.sfBands
     sfBands_short = codingParams.sfBands_short
-    if codingParams.blockType == SHORT:
+    if codingParams.blockType == SHORT and features.AC2A_BLOCK_SWITCHING:
+        # AC-2A: single 256-sample SHORT sub-block
+        halfN = halfN_short
+        N = N_short
+        sfBands = sfBands_short
+        nScaleBits = codingParams.nScaleBits
+
+        timeSamples = data  # 256 samples
+        mdctTimeSamples = WindowForBlockType(SHORT, N_long, N_short) * timeSamples
+        mdctLines = MDCT(mdctTimeSamples, halfN, halfN)[:halfN]
+
+        maxLine = np.max(np.abs(mdctLines))
+        overallScale = ScaleFactor(maxLine, nScaleBits)
+        mdctLines_scaled = mdctLines * (1 << overallScale)
+
+        masking_samples = codingParams._masking_signal if codingParams._masking_signal is not None else timeSamples
+        SMRs = CalcSMRs(masking_samples, mdctLines_scaled, overallScale, codingParams.sampleRate, sfBands)
+
+        _short_boost = 2.0 if features.SHORT_BLOCK_BITBOOST else 1.0
+        bitBudget = int(codingParams.targetBitsPerSample * halfN * _short_boost)
+        bitBudget -= nScaleBits * (sfBands.nBands + 1)
+        bitBudget -= codingParams.nMantSizeBits * sfBands.nBands
+        bitBudget -= codingParams._block_overhead
+        bitBudget = max(int(bitBudget * codingParams._entropy_inflation_short), 0)
+
+        bitAlloc_s = BitAlloc(bitBudget, maxMantBits, sfBands.nBands, sfBands.nLines, SMRs)
+        scaleFactor_s = np.empty(sfBands.nBands, dtype=np.uint64)
+        nMant = halfN
+        for iBand in range(sfBands.nBands):
+            if not bitAlloc_s[iBand]: nMant -= sfBands.nLines[iBand]
+        mantissa_s = np.empty(nMant, dtype=np.int32)
+        iMant = 0
+        for iBand in range(sfBands.nBands):
+            lowLine = int(sfBands.lowerLine[iBand])
+            highLine = int(sfBands.upperLine[iBand]) + 1
+            nLines = int(sfBands.nLines[iBand])
+            band_lines = mdctLines_scaled[lowLine:highLine]
+            scaleLine = np.max(np.abs(band_lines))
+            scaleFactor_s[iBand] = ScaleFactor(scaleLine, nScaleBits, bitAlloc_s[iBand])
+            if bitAlloc_s[iBand]:
+                mantissa_s[iMant:iMant+nLines] = vMantissa(
+                    band_lines, scaleFactor_s[iBand], nScaleBits, bitAlloc_s[iBand])
+                iMant += nLines
+        return (scaleFactor_s, bitAlloc_s, mantissa_s, overallScale)
+
+    elif codingParams.blockType == MEDIUM and features.AC2A_BLOCK_SWITCHING:
+        # Cascade intermediate block
+        ca = codingParams.cascade_a
+        cb = codingParams.cascade_b
+        halfN = (ca + cb) // 2
+        sfBands = DesignSFBands(halfN, codingParams.sampleRate)
+
+        timeSamples = data
+        mdctTimeSamples = WindowForBlockType(MEDIUM, N_long, N_short,
+                                             cascade_a=ca, cascade_b=cb) * timeSamples
+        mdctLines = MDCT(mdctTimeSamples, ca, cb)[:halfN]
+
+        maxLine = np.max(np.abs(mdctLines))
+        overallScale = ScaleFactor(maxLine, nScaleBits)
+        mdctLines *= (1 << overallScale)
+
+        masking_samples = codingParams._masking_signal if codingParams._masking_signal is not None else timeSamples
+        SMRs = CalcSMRs(masking_samples, mdctLines, overallScale, codingParams.sampleRate, sfBands)
+
+        bitBudget = codingParams.targetBitsPerSample * halfN
+        bitBudget -= nScaleBits * (sfBands.nBands + 1)
+        bitBudget -= codingParams.nMantSizeBits * sfBands.nBands
+        bitBudget -= codingParams._block_overhead
+        bitBudget = max(int(bitBudget * codingParams._entropy_inflation), 0)
+
+        bitAlloc_m = BitAlloc(bitBudget, maxMantBits, sfBands.nBands, sfBands.nLines, SMRs)
+        scaleFactor_m = np.empty(sfBands.nBands, dtype=np.uint64)
+        nMant = halfN
+        for iBand in range(sfBands.nBands):
+            if not bitAlloc_m[iBand]: nMant -= sfBands.nLines[iBand]
+        mantissa_m = np.empty(nMant, dtype=np.int32)
+        iMant = 0
+        for iBand in range(sfBands.nBands):
+            lowLine = sfBands.lowerLine[iBand]
+            highLine = sfBands.upperLine[iBand] + 1
+            nLines = sfBands.nLines[iBand]
+            band_lines = mdctLines[lowLine:highLine]
+            scaleLine = np.max(np.abs(band_lines))
+            scaleFactor_m[iBand] = ScaleFactor(scaleLine, nScaleBits, bitAlloc_m[iBand])
+            if bitAlloc_m[iBand]:
+                mantissa_m[iMant:iMant+nLines] = vMantissa(
+                    band_lines, scaleFactor_m[iBand], nScaleBits, bitAlloc_m[iBand])
+                iMant += nLines
+        return (scaleFactor_m, bitAlloc_m, mantissa_m, overallScale)
+
+    elif codingParams.blockType in (START, STOP) and features.AC2A_BLOCK_SWITCHING:
+        # AC-2A: asymmetric transition block (b variable for cascade START*)
+        ca = getattr(codingParams, 'cascade_a', halfN_long)
+        cb = getattr(codingParams, 'cascade_b', halfN_short)
+        halfN_trans = (ca + cb) // 2
+        halfN = halfN_trans
+        sfBands = DesignSFBands(halfN_trans, codingParams.sampleRate) \
+            if halfN_trans != getattr(codingParams, 'nMDCTLines_trans', halfN_trans) \
+            else codingParams.sfBands_trans
+
+        timeSamples = data
+        mdctTimeSamples = WindowForBlockType(codingParams.blockType, N_long, N_short,
+                                             cascade_a=ca, cascade_b=cb) * timeSamples
+        mdctLines = MDCT(mdctTimeSamples, ca, cb)[:halfN_trans]
+
+        if codingParams._mdct_pred_correction is not None:
+            mdctLines = mdctLines + codingParams._mdct_pred_correction
+
+        maxLine = np.max(np.abs(mdctLines))
+        overallScale = ScaleFactor(maxLine, nScaleBits)
+        mdctLines *= (1 << overallScale)
+
+        masking_samples = codingParams._masking_signal if codingParams._masking_signal is not None else timeSamples
+        SMRs = CalcSMRs(masking_samples, mdctLines, overallScale, codingParams.sampleRate, sfBands)
+
+        bitBudget = codingParams.targetBitsPerSample * halfN
+        bitBudget -= nScaleBits * (sfBands.nBands + 1)
+        bitBudget -= codingParams.nMantSizeBits * sfBands.nBands
+        bitBudget -= codingParams._block_overhead
+        bitBudget = max(int(bitBudget * codingParams._entropy_inflation), 0)
+
+        bitAlloc_t = BitAlloc(bitBudget, maxMantBits, sfBands.nBands, sfBands.nLines, SMRs)
+        scaleFactor_t = np.empty(sfBands.nBands, dtype=np.uint64)
+        nMant = halfN
+        for iBand in range(sfBands.nBands):
+            if not bitAlloc_t[iBand]: nMant -= sfBands.nLines[iBand]
+        mantissa_t = np.empty(nMant, dtype=np.int32)
+        iMant = 0
+        for iBand in range(sfBands.nBands):
+            lowLine = sfBands.lowerLine[iBand]
+            highLine = sfBands.upperLine[iBand] + 1
+            nLines = sfBands.nLines[iBand]
+            band_lines = mdctLines[lowLine:highLine]
+            scaleLine = np.max(np.abs(band_lines))
+            scaleFactor_t[iBand] = ScaleFactor(scaleLine, nScaleBits, bitAlloc_t[iBand])
+            if bitAlloc_t[iBand]:
+                mantissa_t[iMant:iMant+nLines] = vMantissa(
+                    band_lines, scaleFactor_t[iBand], nScaleBits, bitAlloc_t[iBand])
+                iMant += nLines
+        return (scaleFactor_t, bitAlloc_t, mantissa_t, overallScale)
+
+    elif codingParams.blockType == SHORT:
+        # Edler: 8-sub-block group encoding
         N = N_short
         halfN = halfN_short
         pad = N_long // 4 - N_short // 4

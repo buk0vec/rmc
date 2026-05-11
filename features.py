@@ -6,7 +6,6 @@ use the same settings; .rmc files are only valid under the features.py
 they were encoded with.
 """
 
-# range-coded mantissas; False = raw bit writes
 from dataclasses import dataclass
 
 
@@ -44,3 +43,9 @@ class RMCFeatures:
     # Bands >= PRED_MAX_SFB are never predicted. Useful for evaluating whether
     # high-frequency prediction is bit-positive after the 7-bit per-band overhead.
     PRED_MAX_SFB: int | None = None
+    # position-adaptive START/STOP windows that align with detected transient; requires BLOCK_SWITCHING
+    AC2A_BLOCK_SWITCHING: bool = True
+    # telescoping pre-attack cascade: START*(b=256/512) + MEDIUM(s) replace pre-attack SHORTs; requires AC2A_BLOCK_SWITCHING
+    ADAPTIVE_CASCADE: bool = True
+    # cap on k_attack (0..15); limits max MEDIUM window size; requires ADAPTIVE_CASCADE
+    K_ATTACK_MAX: int = 15

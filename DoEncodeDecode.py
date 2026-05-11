@@ -85,19 +85,3 @@ if __name__ == "__main__":
         tempo=124,
         features=features_pred,
     )
-    # EncodeDecode(
-    #     inFilename="spiralsunfold.wav",
-    #     codedFilename="subase.pac",
-    #     outFilename="spirals_unfold_nopred.wav",
-    #     targetBitsPerSample=80000 / 44100,
-    #     tempo=130,
-    #     features=features,
-    # )
-    # EncodeDecode(
-    #     inFilename="spiralsunfold.wav",
-    #     codedFilename="supred.pac",
-    #     outFilename="spirals_unfold_pred.wav",
-    #     targetBitsPerSample=80000 / 44100,
-    #     tempo=130,
-    #     features=features_pred,
-    # )

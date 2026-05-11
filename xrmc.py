@@ -25,6 +25,7 @@ from features import RMCFeatures
 from pcmfile import *  # to get access to WAV file handling
 from rmcfile import *  # to get access to RMC file handling
 from simple_run import detectTransients
+from spe import detectTransientsSPESamples
 
 
 def print_flavor():
@@ -84,22 +85,66 @@ def Encode(
         print(f"\nEncoding {inFilename} -> {codedFilename} at {kbps} kb/s")
 
     if features.BLOCK_SWITCHING:
-        transient_map = detectTransients(inFilename, verbose=False)
-        # Shift transient map back by 1 block for lookahead: the START block must
-        # precede the transient so that SHORT blocks capture the actual attack.
-        # Without this, the kick itself gets a LONG MDCT (START) and the post-kick
-        # bass content lands in SHORT blocks with terrible low-frequency resolution.
-        transient_map = {max(x - 1, 0): 0 for x in transient_map}
-        if verbose:
-            print(
-                f"TransientDetection complete: found transients in {len(transient_map)} blocks"
+        if features.AC2A_BLOCK_SWITCHING:
+            events = detectTransientsSPESamples(inFilename, nMDCTLines=nMDCTLines, verbose=verbose)
+        else:
+            events = detectTransients(
+                inFilename,
+                verbose=False,
+                return_events=True,
+                forceBlockSize=nMDCTLines,
             )
+        if features.AC2A_BLOCK_SWITCHING:
+            # Exact sample positions — no grid alignment or shift heuristics needed.
+            # Enforce minimum 2048-sample spacing so cascades can never collide.
+            # min cascade = (15+0)*halfN_short + halfN_short + halfN_short + halfN
+            #             = 17*halfN_short + halfN  (halfN_short = nMDCTLines//16)
+            min_spacing = 17 * (nMDCTLines // 16) + nMDCTLines  # 2112 samples
+            transient_positions = []
+            last_pos = -min_spacing
+            for e in events:
+                si = int(e["sample_index"])
+                if si - last_pos >= min_spacing and si >= nMDCTLines:
+                    transient_positions.append(si)
+                    last_pos = si
+            transient_map = {}  # unused in AC2A path
+            if verbose:
+                print(f"TransientDetection: {len(transient_positions)} events (exact positions)")
+        else:
+            # Edler fallback: grid-aligned block-based map with shift heuristic
+            transient_map = {}
+            n_shift_m1 = 0
+            n_shift_0 = 0
+            for event in events:
+                block = int(event["block"])
+                p = int(event["sample_offset"])
+                if p < 448:
+                    shift = -1
+                elif p > 576:
+                    shift = 0
+                else:
+                    shift = -1 if p < 512 else 0
+                shifted_block = max(block + shift, 0)
+                k_attack = min(p // (nMDCTLines // 8), 7)
+                transient_map[shifted_block] = k_attack
+                if shift == -1:
+                    n_shift_m1 += 1
+                else:
+                    n_shift_0 += 1
+            transient_positions = []
+            if verbose:
+                print(
+                    f"TransientDetection: {len(transient_map)} blocks "
+                    f"(shift: -1={n_shift_m1}, 0={n_shift_0})"
+                )
     else:
         transient_map = {}
+        transient_positions = []
         if verbose:
             print("Block switching disabled, using all LONG blocks")
 
     codingParams.transientBlocks = transient_map
+    codingParams.transientPositions = transient_positions
     codingParams.blockIndex = 0
 
     # Adjust targetBitsPerSample so SHORT blocks' boosted budget
