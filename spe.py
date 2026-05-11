@@ -35,14 +35,14 @@ import scipy.signal
 # L4 (N/16 =  128 samples): ratio > 14.3×  — 128-sample resolution
 # L5 (N/32 =   64 samples): ratio > 14.3×  — finest resolution, matches SHORT half-window
 # Validated empirically on castanets / glockenspiel / harpsichord (EBU-SQAM).
-THRESHOLDS = (0.4, 0.4, 0.07, 0.07, 0.07)
+THRESHOLDS = (0.4, 0.4, 0.07, 0.07, 0.05)
 
 # Paper uses 1500/32768 ≈ 0.046 at 8 kHz HPF cutoff. Lowering cutoff to 2 kHz
 # passes more attack energy from low-frequency instruments (harpsichord, plucked
 # strings); zero_threshold of 750/32768 avoids noise false-positives at that cutoff.
 # Validated on castanets (88), glockenspiel (29), harpsichord (10).
 ZERO_THRESHOLD = 750.0 / 32768.0    # ≈ 0.0229
-HPF_CUTOFF = 2000.0                 # Hz; lower than paper's 8 kHz
+HPF_CUTOFF = 800.0                  # Hz; lowered from 2kHz to catch bass-heavy gradual transients
 
 
 def _design_highpass(sr: int, cutoff: float = HPF_CUTOFF, order: int = 4):
@@ -57,6 +57,31 @@ def _sub_peak(buf: np.ndarray, start: int, length: int) -> float:
     return float(np.max(np.abs(buf[start: start + length])))
 
 
+def _refine_offset(hp_buf: np.ndarray, start: int, sub: int, target: int = 64,
+                   zero_threshold: float = ZERO_THRESHOLD) -> int:
+    """
+    Binary bisection within a detected sub-block down to `target`-sample resolution.
+    Picks the higher-peak half at each step, then backs up one slot if the preceding
+    slot carries >= 25% of the detection slot's energy (onset is there, not at peak).
+    Returns absolute start index of the chosen target-size sub-block.
+    No-op if sub == target already.
+    """
+    half = len(hp_buf) // 2
+    while sub > target:
+        sub //= 2
+        e_lo = _sub_peak(hp_buf, start, sub)
+        e_hi = _sub_peak(hp_buf, start + sub, sub)
+        if e_hi > e_lo:
+            start += sub
+    # Back up one target-sized slot if the preceding slot has significant onset energy
+    if start - target >= half:
+        e_prev = _sub_peak(hp_buf, start - target, target)
+        e_curr = _sub_peak(hp_buf, start, target)
+        if e_prev >= 0.25 * e_curr:
+            start -= target
+    return start
+
+
 def spe_block(hp_buf: np.ndarray,
               N: int,
               thresholds: tuple = THRESHOLDS,
@@ -67,20 +92,21 @@ def spe_block(hp_buf: np.ndarray,
     Layout: buf[0 : N//2] = previous half-block
             buf[N//2 : N] = current half-block
 
-    Runs all 5 layers coarse-to-fine. Each firing layer overwrites the previous
-    best_offset, so the finest (highest-j) layer that fires sets the final position.
+    Runs L1–L5 coarse-to-fine via threshold comparison. Each firing layer
+    overwrites best_offset. After the loop, if the finest firing layer is
+    coarser than 64 samples, _refine_offset bisects that sub-block down to
+    64-sample resolution using peak energy.
 
     Returns
     -------
     fired : bool
     sample_offset : int
-        Byte offset of the first firing sub-block within the current half,
-        at the finest resolution layer that fired. 0 if not fired.
-        Resolution: 64 samples (L5), 128 (L4), 256 (L3), 512 (L2), 1024 (L1).
+        Onset offset within the current half at 64-sample resolution. 0 if not fired.
     """
     half = N >> 1
     fired = False
     best_offset = 0
+    best_sub = 64  # sub-block size at the finest layer that fired
 
     for j in range(1, 6):
         sub = N >> j            # sub-block size: N/2, N/4, N/8, N/16, N/32
@@ -90,10 +116,15 @@ def spe_block(hp_buf: np.ndarray,
         for k in range(n_curr):
             curr_peak = _sub_peak(hp_buf, half + k * sub, sub)
             if curr_peak > zero_threshold and curr_peak * T > prev_peak:
-                best_offset = k * sub   # finer layers always overwrite coarser
+                best_offset = k * sub
+                best_sub = sub
                 fired = True
-                break                  # first firing sub-block per layer
+                break
             prev_peak = curr_peak
+
+    if fired and best_sub > 64:
+        best_offset = _refine_offset(hp_buf, half + best_offset, best_sub,
+                                     zero_threshold=zero_threshold) - half
 
     return fired, best_offset
 

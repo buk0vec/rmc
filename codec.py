@@ -7,8 +7,7 @@ codec.py -- The actual encode/decode functions for the perceptual audio codec
 """
 
 import numpy as np  # used for arrays
-from features import SHORT_BLOCK_BITBOOST, TNS, AC2A_BLOCK_SWITCHING
-from tns import apply_tns_encode, apply_tns_decode
+from features import SHORT_BLOCK_BITBOOST, AC2A_BLOCK_SWITCHING
 from blockswitching import LONG, START, SHORT, STOP, MEDIUM, DesignSFBands
 from psychoac import ScaleFactorBands, AssignMDCTLinesFromFreqLimits
 
@@ -21,7 +20,7 @@ from psychoac import CalcSMRs  # calculates SMRs for each scale factor band
 from bitalloc import BitAlloc  #allocates bits to scale factor bands given SMRs
 from blockswitching import WindowForBlockType, LONG, SHORT, N_SHORT_BLOCKS
 
-def Decode(scaleFactor,bitAlloc,mantissa,overallScaleFactor,codingParams,mdct_pred=None,tns_info=None):
+def Decode(scaleFactor,bitAlloc,mantissa,overallScaleFactor,codingParams,mdct_pred=None):
     """Reconstitutes a single-channel block of encoded data into a block of
     signed-fraction data based on the parameters in a PACFile object"""
 
@@ -113,8 +112,6 @@ def Decode(scaleFactor,bitAlloc,mantissa,overallScaleFactor,codingParams,mdct_pr
                         sf[iBand], mant[iMant:iMant+nLines], codingParams.nScaleBits, ba[iBand])
                 iMant += nLines
             mdctLine /= rescaleLevel
-            if TNS and tns_info is not None:
-                mdctLine = apply_tns_decode(mdctLine, tns_info[i])
             data = WindowForBlockType(SHORT, N_long, N_short) * IMDCT(mdctLine, halfN, halfN)
             overlap_and_add[pad + i*halfN_short : pad + i*halfN_short + N_short] += data
         return overlap_and_add
@@ -163,22 +160,17 @@ def Encode(data,codingParams):
     bitAlloc = []
     mantissa = []
     overallScaleFactor = []
-    tnsShortInfo = []
-
     # loop over channels and separately encode each one
     for iCh in range(codingParams.nChannels):
         codingParams._masking_signal = codingParams.masking_signals[iCh] if codingParams.masking_signals is not None else None
         codingParams._mdct_pred_correction = codingParams.mdct_pred_corrections[iCh] if codingParams.mdct_pred_corrections is not None else None
         codingParams._block_overhead = codingParams.block_overhead[iCh] if codingParams.block_overhead is not None else 0
-        (s,b,m,o,t) = EncodeSingleChannel(data[iCh],codingParams)
+        (s,b,m,o,_) = EncodeSingleChannel(data[iCh],codingParams)
         scaleFactor.append(s)
         bitAlloc.append(b)
         mantissa.append(m)
         overallScaleFactor.append(o)
-        tnsShortInfo.append(t)
     # return results bundled over channels
-
-    codingParams._tns_short_info = tnsShortInfo
     return (scaleFactor,bitAlloc,mantissa,overallScaleFactor)
 
 
@@ -348,7 +340,6 @@ def EncodeSingleChannel(data,codingParams):
         sub_ovs = []
         sub_smrs = []
         sub_time = []
-        sub_tns_info = []
         for i in range(N_SHORT_BLOCKS):
             timeSamples = data[pad + i*halfN : pad + i*halfN + N]
             sub_time.append(timeSamples)
@@ -358,10 +349,6 @@ def EncodeSingleChannel(data,codingParams):
             maxLine = np.max(np.abs(mdctLines))
             overallScale = ScaleFactor(maxLine, nScaleBits)
             mdctLines_scaled = mdctLines * (1 << overallScale)
-            if TNS:
-                mdctLines_scaled, tns_info = apply_tns_encode(mdctLines_scaled)
-            else:
-                tns_info = {"enabled": False, "coeff_q": 0}
 
             masking_samples = codingParams._masking_signal[pad + i*halfN : pad + i*halfN + N] if codingParams._masking_signal is not None else timeSamples
             SMRs = CalcSMRs(masking_samples, mdctLines_scaled, overallScale, codingParams.sampleRate, sfBands_short)
@@ -369,7 +356,6 @@ def EncodeSingleChannel(data,codingParams):
             sub_ovs.append(overallScale)
             sub_mdct_scaled.append(mdctLines_scaled)
             sub_smrs.append(SMRs)
-            sub_tns_info.append(tns_info)
 
         # Phase 2: grouped encoding — shared sf/ba per group, per-sub-block mantissa
         all_sf = []
@@ -435,7 +421,7 @@ def EncodeSingleChannel(data,codingParams):
 
             sub_idx += G
 
-        return (all_sf, all_ba, all_mant, all_ovs, sub_tns_info)
+        return (all_sf, all_ba, all_mant, all_ovs, None)
     
     else: 
         N = N_long

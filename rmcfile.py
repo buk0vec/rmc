@@ -13,12 +13,11 @@ from bitpack import *  # class for packing data into an array of bytes where eac
 import codec    # module where the actual PAC coding functions reside(this module only specifies the PAC file format)
 from psychoac import ScaleFactorBands, AssignMDCTLinesFromFreqLimits  # defines the grouping of MDCT lines into scale factor bands
 from entropy import BlockEntropyCoder, RawMantissaCoder
-from features import ENTROPY_CODING, VARIABLE_BIT_RATE, MID_SIDE_CODING, PREDICTION, SUBBASS_HYBRID, TNS, AC2A_BLOCK_SWITCHING, ADAPTIVE_CASCADE, K_ATTACK_MAX
+from features import ENTROPY_CODING, VARIABLE_BIT_RATE, MID_SIDE_CODING, PREDICTION, SUBBASS_HYBRID, AC2A_BLOCK_SWITCHING, ADAPTIVE_CASCADE, K_ATTACK_MAX
 import bisect
 from blockswitching import LONG, START, SHORT, STOP, MEDIUM, N_SHORT_BLOCKS, ShortBlockSFBands, TransitionSFBands, WindowForBlockType, SelectBlockType, mask_to_group_lens, plan_cascade, DesignSFBands
 from mdct import MDCT, IMDCT
 from search import get_best_region, PRED_MAP, GAIN_TABLE, pred_type_to_samples, update_search_buffer
-from tns import TNS_COEFF_BITS, coeff_to_bits, bits_to_coeff
 import subbass
 
 import numpy as np  # to allow conversion of data blocks to numpy's array object
@@ -187,7 +186,6 @@ class RMCFile(AudioFile):
                 overallScaleFactor = pb.ReadBits(codingParams.nScaleBits)
                 scaleFactor = []
                 bitAlloc = []
-                tns_info = None
                 for _ in range(sfBands_short.nBands):
                     ba = pb.ReadBits(codingParams.nMantSizeBits)
                     if ba: ba += 1
@@ -205,7 +203,6 @@ class RMCFile(AudioFile):
                 overallScaleFactor = pb.ReadBits(codingParams.nScaleBits)
                 scaleFactor = []
                 bitAlloc = []
-                tns_info = None
                 for _ in range(sfBands_med.nBands):
                     ba = pb.ReadBits(codingParams.nMantSizeBits)
                     if ba: ba += 1
@@ -222,7 +219,6 @@ class RMCFile(AudioFile):
                 scaleFactor = []
                 bitAlloc = []
                 mantissa = []
-                tns_info = []
                 for G in group_lens:
                     # Read shared ba/sf once for this group
                     shared_ba = []
@@ -241,19 +237,11 @@ class RMCFile(AudioFile):
                         scaleFactor.append(shared_sf)
                         bitAlloc.append(shared_ba)
                         mantissa.append(mant_i)
-                if TNS:
-                    for _ in range(N_SHORT_BLOCKS):
-                        enabled = bool(pb.ReadBits(1))
-                        coeff_q = bits_to_coeff(pb.ReadBits(TNS_COEFF_BITS)) if enabled else 0
-                        tns_info.append({"enabled": enabled, "coeff_q": coeff_q})
-                else:
-                    tns_info = None
             else:
                 # LONG and START/STOP (AC-2A or Edler)
                 overallScaleFactor = pb.ReadBits(codingParams.nScaleBits)
                 scaleFactor = []
                 bitAlloc = []
-                tns_info = None
                 if AC2A_BLOCK_SWITCHING and codingParams.blockType in (START, STOP):
                     ca = getattr(codingParams, 'cascade_a', halfN)
                     cb = getattr(codingParams, 'cascade_b', codingParams.nMDCTLines_short)
@@ -301,7 +289,7 @@ class RMCFile(AudioFile):
                     mdct_P = pred_alpha_q * mdct_P_raw * enable_mask
 
             decodedData = self.Decode(scaleFactor, bitAlloc, mantissa, overallScaleFactor,
-                                      codingParams, mdct_pred=mdct_P, tns_info=tns_info)
+                                      codingParams, mdct_pred=mdct_P)
 
             # Sub-bass hybrid: read K low-band bins and add LONG IMDCT reconstruction
             if has_subbass:
@@ -733,9 +721,6 @@ class RMCFile(AudioFile):
             if current_block_type == SHORT:
                 if not AC2A_BLOCK_SWITCHING:
                     oh += 7  # grouping mask (Edler only)
-                if TNS and not AC2A_BLOCK_SWITCHING:
-                    # Reserve worst-case TNS side info for budgeting: flag + coeff per sub-block.
-                    oh += N_SHORT_BLOCKS * (1 + TNS_COEFF_BITS)
             if SUBBASS_HYBRID:
                 if current_block_type == LONG:
                     oh += 1  # has_subbass flag bit
@@ -750,7 +735,6 @@ class RMCFile(AudioFile):
         codingParams.mdct_pred_corrections = corrections
         codingParams.block_overhead = block_overhead
         (scaleFactor, bitAlloc, mantissa, overallScaleFactor) = self.Encode(fullBlockData, codingParams)
-        tns_short_info = getattr(codingParams, "_tns_short_info", None)
         codingParams.masking_signals = None
         codingParams.mdct_pred_corrections = None
 
@@ -809,8 +793,7 @@ class RMCFile(AudioFile):
                              for i in range(N_SHORT_BLOCKS)]
                 decodedData = codec.Decode(
                     scaleFactor[iCh], bitAlloc[iCh], full_mant,
-                    overallScaleFactor[iCh], codingParams,
-                    tns_info=tns_short_info[iCh] if tns_short_info is not None else None
+                    overallScaleFactor[iCh], codingParams
                 )
             # Sub-bass hybrid: add quantized y_low LONG IMDCT so search buffer matches decoder.
             # Every non-LONG block + adjacent LONG: decoder outputs y_high + y_low; buffer must match.
@@ -899,11 +882,6 @@ class RMCFile(AudioFile):
                         nBits += codingParams.nScaleBits  # overallScaleFactor
                         nBits += entropy_pb.nBits
                     sub_idx += G
-                if TNS:
-                    for info in tns_short_info[iCh]:
-                        nBits += 1
-                        if info["enabled"]:
-                            nBits += TNS_COEFF_BITS
                 # Update SHORT entropy compression ratio (EMA)
                 if VARIABLE_BIT_RATE:
                     _raw_short = sum(
@@ -1025,11 +1003,6 @@ class RMCFile(AudioFile):
                         pb.WriteBits(entropy_pbs[ep_idx].buffer, entropy_pbs[ep_idx].nBits)
                         ep_idx += 1
                     sub_idx += G
-                if TNS:
-                    for info in tns_short_info[iCh]:
-                        pb.WriteBits(1 if info["enabled"] else 0, 1)
-                        if info["enabled"]:
-                            pb.WriteBits(coeff_to_bits(info["coeff_q"]), TNS_COEFF_BITS)
             else:
                 # LONG and START/STOP (AC-2A or Edler) — _sfb_enc already computed above
                 pb.WriteBits(overallScaleFactor[iCh], codingParams.nScaleBits)
@@ -1124,13 +1097,13 @@ class RMCFile(AudioFile):
         #Passes encoding logic to the Encode function defined in the codec module
         return codec.Encode(data,codingParams)
 
-    def Decode(self,scaleFactor,bitAlloc,mantissa, overallScaleFactor,codingParams,mdct_pred=None,tns_info=None):
+    def Decode(self,scaleFactor,bitAlloc,mantissa, overallScaleFactor,codingParams,mdct_pred=None):
         """
         Decodes a single audio channel of data based on the values of its scale factors,
         bit allocations, quantized mantissas, and overall scale factor.
         """
         #Passes decoding logic to the Decode function defined in the codec module
-        return codec.Decode(scaleFactor,bitAlloc,mantissa, overallScaleFactor,codingParams,mdct_pred,tns_info)
+        return codec.Decode(scaleFactor,bitAlloc,mantissa, overallScaleFactor,codingParams,mdct_pred)
 
 
 
