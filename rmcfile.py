@@ -29,18 +29,7 @@ from blockswitching import (
     mask_to_group_lens,
 )
 from entropy import BlockEntropyCoder, RawMantissaCoder
-from features import (
-    COMPLEX_PREDICTION,
-    ENTROPY_CODING,
-    MID_SIDE_CODING,
-    PRED_ENABLE_RATIO,
-    PRED_ENABLE_RMS,
-    PRED_ENABLE_SF,
-    PRED_EXTENDED_RANGE,
-    PRED_NLINES_THRESH,
-    PREDICTION,
-    VARIABLE_BIT_RATE,
-)
+from features import RMCFeatures
 from mdct import MDCT
 from psychoac import (  # defines the grouping of MDCT lines into scale factor bands
     AssignMDCTLinesFromFreqLimits,
@@ -68,6 +57,11 @@ class RMCFile(AudioFile):
 
     # a file tag to recognize PAC coded files
     tag = b"RMC "
+
+    def __init__(self, filename, features: RMCFeatures = RMCFeatures()):
+        """Object is initialized with its filename"""
+        self.filename = filename
+        self.features = features
 
     def ReadFileHeader(self):
         """
@@ -116,7 +110,11 @@ class RMCFile(AudioFile):
         myParams.search_range = 1023
         # Buffer sized to hold the furthest lookback (4 bars) plus one block and search margin.
         buf_size = (
-            (myParams.numSamples4Bar if PRED_EXTENDED_RANGE else myParams.numSamplesBar)
+            (
+                myParams.numSamples4Bar
+                if self.features.PRED_EXTENDED_RANGE
+                else myParams.numSamplesBar
+            )
             + nMDCTLines
             + myParams.search_range
         )
@@ -128,10 +126,14 @@ class RMCFile(AudioFile):
 
         # entropy coders
         myParams.entropyCoder_long = (
-            BlockEntropyCoder(14) if ENTROPY_CODING else RawMantissaCoder()
+            BlockEntropyCoder(14)
+            if self.features.ENTROPY_CODING
+            else RawMantissaCoder()
         )
         myParams.entropyCoder_short = (
-            BlockEntropyCoder(14) if ENTROPY_CODING else RawMantissaCoder()
+            BlockEntropyCoder(14)
+            if self.features.ENTROPY_CODING
+            else RawMantissaCoder()
         )
         # start w/o all zeroes as data from prior block to overlap-and-add for output
         overlapAndAdd = []
@@ -175,7 +177,7 @@ class RMCFile(AudioFile):
 
             codingParams.blockType = pb.ReadBits(2)
             # Quarter/half/bar, potentially more
-            pred_type = pb.ReadBits(3 if PRED_EXTENDED_RANGE else 2)
+            pred_type = pb.ReadBits(3 if self.features.PRED_EXTENDED_RANGE else 2)
             # M/S flag: stored only in channel 0 for stereo files
             if iCh == 0 and codingParams.nChannels == 2:
                 use_ms = bool(pb.ReadBits(1))
@@ -188,12 +190,12 @@ class RMCFile(AudioFile):
             pred_enable_flags = None
             # If prediction is enabled for this block
             if pred_type != PRED_MAP[None]:
-                # Read in the offset
+                # Read the offset: block-unit (4 bits) or sample-unit (10 bits)
                 pred_sign = pb.ReadBits(1)
                 pred_offset = pb.ReadBits(10)
                 if pred_sign == 1:
                     pred_offset *= -1
-                if not COMPLEX_PREDICTION:
+                if not self.features.COMPLEX_PREDICTION:
                     # Use global gain for predictive region
                     pred_alpha_q = GAIN_TABLE[pb.ReadBits(4)]
                 if (
@@ -203,7 +205,7 @@ class RMCFile(AudioFile):
                     pred_enable_flags = [
                         bool(pb.ReadBits(1)) for _ in range(codingParams.sfBands.nBands)
                     ]
-                    if COMPLEX_PREDICTION:
+                    if self.features.COMPLEX_PREDICTION:
                         pred_alpha_qs = np.ones(codingParams.sfBands.nBands)
                         pred_phase_qs = np.zeros(codingParams.sfBands.nBands)
                         # Magnitude and phases per SFB
@@ -285,7 +287,7 @@ class RMCFile(AudioFile):
                     )[:halfN]
                     # Pull out real MDCT part from MCLT
                     mdct_P_raw = mdct_P_raw_cplx.real
-                    if COMPLEX_PREDICTION:
+                    if self.features.COMPLEX_PREDICTION:
                         # Also pull out the MDST part from MCLT
                         mdst_P_raw = mdct_P_raw_cplx.imag
                         effective_pred = np.zeros(halfN)
@@ -425,10 +427,14 @@ class RMCFile(AudioFile):
         )
         codingParams.blockType = LONG
         codingParams.entropyCoder_long = (
-            BlockEntropyCoder(14) if ENTROPY_CODING else RawMantissaCoder()
+            BlockEntropyCoder(14)
+            if self.features.ENTROPY_CODING
+            else RawMantissaCoder()
         )
         codingParams.entropyCoder_short = (
-            BlockEntropyCoder(14) if ENTROPY_CODING else RawMantissaCoder()
+            BlockEntropyCoder(14)
+            if self.features.ENTROPY_CODING
+            else RawMantissaCoder()
         )
 
         # RMC extras
@@ -451,7 +457,7 @@ class RMCFile(AudioFile):
         buf_size = (
             (
                 codingParams.numSamples4Bar
-                if PRED_EXTENDED_RANGE
+                if self.features.PRED_EXTENDED_RANGE
                 else codingParams.numSamplesBar
             )
             + codingParams.nMDCTLines
@@ -494,6 +500,15 @@ class RMCFile(AudioFile):
         codingParams._entropy_inflation = 1.0
         codingParams._entropy_ratio_short = 1.0
         codingParams._entropy_inflation_short = 1.0
+        # Band enable rate stats for ranges 1-5, 1-10, 1-15, 1-20
+        codingParams._stat_band_1_5_sum = 0.0
+        codingParams._stat_band_1_5_count = 0
+        codingParams._stat_band_1_10_sum = 0.0
+        codingParams._stat_band_1_10_count = 0
+        codingParams._stat_band_1_15_sum = 0.0
+        codingParams._stat_band_1_15_count = 0
+        codingParams._stat_band_1_20_sum = 0.0
+        codingParams._stat_band_1_20_count = 0
         # Defaults for per-encode-pass state (set properly before second encode)
         codingParams.masking_signals = None
         codingParams.mdct_pred_corrections = None
@@ -520,7 +535,7 @@ class RMCFile(AudioFile):
 
         # Block-level M/S stereo decision: use M/S if side energy < min(L energy, R energy)
         use_ms = False
-        if MID_SIDE_CODING and codingParams.nChannels == 2:
+        if self.features.MID_SIDE_CODING and codingParams.nChannels == 2:
             L, R = block_input[0], block_input[1]
             M = (L + R) * 0.5
             S = (L - R) * 0.5
@@ -573,7 +588,7 @@ class RMCFile(AudioFile):
         enable_masks = []
         corrections = []
         for iCh in range(codingParams.nChannels):
-            if PREDICTION and current_block_type != SHORT:
+            if self.features.PREDICTION and current_block_type != SHORT:
                 window = WindowForBlockType(current_block_type, N, N_short)
                 mdct_X = MDCT(window * block_input[iCh], halfN, halfN)[:halfN]
                 # Run predictive search
@@ -591,12 +606,13 @@ class RMCFile(AudioFile):
                     block_input[iCh],
                     codingParams,
                     search_bufs[iCh],
+                    self.features,
                     block_type=current_block_type,
                 )
                 # If we found a good enough region for prediction
                 if range_type is not None:
                     # Reconstruct per-band residual for the enable decision
-                    if COMPLEX_PREDICTION:
+                    if self.features.COMPLEX_PREDICTION:
                         residual_full = np.empty(halfN)
                         for iBand in range(codingParams.sfBands.nBands):
                             lo = codingParams.sfBands.lowerLine[iBand]
@@ -619,6 +635,11 @@ class RMCFile(AudioFile):
                     enable_f = np.zeros(codingParams.sfBands.nBands, dtype=bool)
                     enable_m = np.zeros(halfN)
                     for iBand in range(codingParams.sfBands.nBands):
+                        if (
+                            self.features.PRED_MAX_SFB is not None
+                            and iBand >= self.features.PRED_MAX_SFB
+                        ):
+                            continue
                         lo = codingParams.sfBands.lowerLine[iBand]
                         hi = codingParams.sfBands.upperLine[iBand] + 1
                         orig_band = np.abs(mdct_X[lo:hi])
@@ -629,22 +650,22 @@ class RMCFile(AudioFile):
                         res_rms = (
                             np.sqrt(np.mean(res_band**2)) if res_band.size else 0.0
                         )
-                        if COMPLEX_PREDICTION:
+                        if self.features.COMPLEX_PREDICTION:
                             n_lines = hi - lo
-                            if PRED_NLINES_THRESH:
+                            if self.features.PRED_NLINES_THRESH:
                                 # Break-even: n_lines * reduction_dB/6 >= 7 bits of per-band overhead
                                 # => RMS threshold = 10^(-42 / (20.0 * n_lines))
                                 threshold = 10.0 ** (-42.0 / (20.0 * n_lines))
                             else:
-                                threshold = PRED_ENABLE_RATIO
+                                threshold = self.features.PRED_ENABLE_RATIO
                             enable = (
                                 res_rms < threshold * orig_rms
                                 if orig_rms > 0
                                 else False
                             )
-                        elif PRED_ENABLE_RMS:
+                        elif self.features.PRED_ENABLE_RMS:
                             enable = res_rms < orig_rms if orig_rms > 0 else False
-                        elif PRED_ENABLE_SF:
+                        elif self.features.PRED_ENABLE_SF:
                             enable = ScaleFactor(
                                 np.amax(res_band), nScaleBits, 0
                             ) > ScaleFactor(np.amax(orig_band), nScaleBits, 0)
@@ -667,7 +688,7 @@ class RMCFile(AudioFile):
                     else:
                         # Per-band MDCT-domain correction: subtract prediction in enabled bands.
                         # pcm_residual == input_pcm, so MDCT(pcm_residual)+correction = per-band residual.
-                        if COMPLEX_PREDICTION:
+                        if self.features.COMPLEX_PREDICTION:
                             correction = np.zeros(halfN)
                             for iBand in range(codingParams.sfBands.nBands):
                                 if enable_f[iBand]:
@@ -734,8 +755,33 @@ class RMCFile(AudioFile):
             ]
             codingParams._stat_band_frac_sum += np.mean(fracs)
 
+            # Band range enable rates (for channels with prediction)
+            for iCh in pred_channels:
+                ef = enable_flags_list[iCh]
+                if len(ef) > 0:
+                    # Bands 1-5 (indices 0-4)
+                    max_idx = min(5, len(ef))
+                    if max_idx > 0:
+                        codingParams._stat_band_1_5_sum += float(np.mean(ef[:max_idx]))
+                        codingParams._stat_band_1_5_count += 1
+                    # Bands 1-10 (indices 0-9)
+                    max_idx = min(10, len(ef))
+                    if max_idx > 0:
+                        codingParams._stat_band_1_10_sum += float(np.mean(ef[:max_idx]))
+                        codingParams._stat_band_1_10_count += 1
+                    # Bands 1-15 (indices 0-14)
+                    max_idx = min(15, len(ef))
+                    if max_idx > 0:
+                        codingParams._stat_band_1_15_sum += float(np.mean(ef[:max_idx]))
+                        codingParams._stat_band_1_15_count += 1
+                    # Bands 1-20 (indices 0-19)
+                    max_idx = min(20, len(ef))
+                    if max_idx > 0:
+                        codingParams._stat_band_1_20_sum += float(np.mean(ef[:max_idx]))
+                        codingParams._stat_band_1_20_count += 1
+
         # Compute per-channel bitstream overhead not accounted for in base bit budget
-        _pred_type_bits = 3 if PRED_EXTENDED_RANGE else 2
+        _pred_type_bits = 3 if self.features.PRED_EXTENDED_RANGE else 2
         block_overhead = []
         for iCh in range(codingParams.nChannels):
             oh = (
@@ -745,11 +791,11 @@ class RMCFile(AudioFile):
                 oh += 1  # M/S flag
             if ranges[iCh] is not None:
                 oh += 1 + 10  # sign + offset
-                if not COMPLEX_PREDICTION:
+                if not self.features.COMPLEX_PREDICTION:
                     oh += 4  # global scalar gain
                 if current_block_type != SHORT:
                     oh += codingParams.sfBands.nBands  # per-band enable flags
-                    if COMPLEX_PREDICTION:
+                    if self.features.COMPLEX_PREDICTION:
                         oh += 7 * int(
                             np.sum(enable_flags_list[iCh])
                         )  # 3b gain + 4b phase per enabled band
@@ -762,7 +808,7 @@ class RMCFile(AudioFile):
         codingParams.mdct_pred_corrections = corrections
         codingParams.block_overhead = block_overhead
         (scaleFactor, bitAlloc, mantissa, overallScaleFactor) = self.Encode(
-            residuals, codingParams
+            residuals, codingParams, self.features
         )
         codingParams.masking_signals = None
         codingParams.mdct_pred_corrections = None
@@ -808,7 +854,7 @@ class RMCFile(AudioFile):
                     mantissa[iCh], bitAlloc[iCh], codingParams.sfBands, halfN
                 )
                 if pred_mdcts[iCh] is not None:
-                    if COMPLEX_PREDICTION:
+                    if self.features.COMPLEX_PREDICTION:
                         mdst_pred = pred_mdsts[iCh]
                         scaled_pred = np.zeros(halfN)
                         _aq = alpha_qs[iCh]  # per-band gain array
@@ -882,14 +928,14 @@ class RMCFile(AudioFile):
             if iCh == 0 and codingParams.nChannels == 2:
                 nBits += 1  # M/S flag
             if ranges[iCh] is not None:
-                nBits += 11  # sign + offset
-                if not COMPLEX_PREDICTION:
+                nBits += 1 + 10  # sign + offset
+                if not self.features.COMPLEX_PREDICTION:
                     nBits += 4  # global scalar gain
                 if codingParams.blockType != SHORT:
                     nBits += (
                         codingParams.sfBands.nBands
                     )  # per-band enables for LONG/START/STOP
-                    if COMPLEX_PREDICTION:
+                    if self.features.COMPLEX_PREDICTION:
                         nBits += 7 * int(
                             np.sum(enable_flags_list[iCh])
                         )  # 3b gain + 4b phase per enabled band
@@ -913,7 +959,7 @@ class RMCFile(AudioFile):
                         nBits += entropy_pb.nBits
                     sub_idx += G
                 # Update SHORT entropy compression ratio (EMA)
-                if VARIABLE_BIT_RATE:
+                if self.features.VARIABLE_BIT_RATE:
                     _raw_short = sum(
                         bitAlloc[iCh][i][iBand] * sfBands_short.nLines[iBand]
                         for i in range(N_SHORT_BLOCKS)
@@ -938,7 +984,7 @@ class RMCFile(AudioFile):
                     nBits += codingParams.nMantSizeBits + codingParams.nScaleBits
                 nBits += entropy_pb.nBits
                 # Update LONG entropy compression ratio (EMA)
-                if VARIABLE_BIT_RATE:
+                if self.features.VARIABLE_BIT_RATE:
                     _raw_long = sum(
                         bitAlloc[iCh][iBand] * codingParams.sfBands.nLines[iBand]
                         for iBand in range(codingParams.sfBands.nBands)
@@ -966,12 +1012,12 @@ class RMCFile(AudioFile):
                 sign = 1 if offsets[iCh] < 0 else 0
                 pb.WriteBits(sign, 1)
                 pb.WriteBits(abs(offsets[iCh]), 10)
-                if not COMPLEX_PREDICTION:
+                if not self.features.COMPLEX_PREDICTION:
                     pb.WriteBits(alpha_idxs[iCh], 4)
                 if codingParams.blockType != SHORT:
                     for iBand in range(codingParams.sfBands.nBands):
                         pb.WriteBits(1 if enable_flags_list[iCh][iBand] else 0, 1)
-                    if COMPLEX_PREDICTION:
+                    if self.features.COMPLEX_PREDICTION:
                         for iBand in range(codingParams.sfBands.nBands):
                             if enable_flags_list[iCh][iBand]:
                                 pb.WriteBits(int(alpha_idxs[iCh][iBand]), 3)
@@ -1023,8 +1069,7 @@ class RMCFile(AudioFile):
         if self.fp.mode == "wb":  # we are writing to the PACFile, must be encode
             # we are writing the coded file -- pass a block of zeros to move last data block to other side of MDCT block
             data = [
-                np.zeros(codingParams.nMDCTLines)
-                for _ in range(codingParams.nChannels)
+                np.zeros(codingParams.nMDCTLines) for _ in range(codingParams.nChannels)
             ]
             self.WriteDataBlock(data, codingParams)
             total = codingParams._stat_total_blocks
@@ -1060,6 +1105,23 @@ class RMCFile(AudioFile):
             print(
                 f"  Avg bands predicted    : {avg_band_frac:.1f}% of all bands (when active)"
             )
+            # Band range enable rates
+            if codingParams._stat_band_1_5_count > 0:
+                print(
+                    f"  Enable rate bands 1-5  : {100 * codingParams._stat_band_1_5_sum / codingParams._stat_band_1_5_count:.1f}%"
+                )
+            if codingParams._stat_band_1_10_count > 0:
+                print(
+                    f"  Enable rate bands 1-10 : {100 * codingParams._stat_band_1_10_sum / codingParams._stat_band_1_10_count:.1f}%"
+                )
+            if codingParams._stat_band_1_15_count > 0:
+                print(
+                    f"  Enable rate bands 1-15 : {100 * codingParams._stat_band_1_15_sum / codingParams._stat_band_1_15_count:.1f}%"
+                )
+            if codingParams._stat_band_1_20_count > 0:
+                print(
+                    f"  Enable rate bands 1-20 : {100 * codingParams._stat_band_1_20_sum / codingParams._stat_band_1_20_count:.1f}%"
+                )
             if codingParams._stat_pred_alloc_count > 0:
                 print(
                     f"  Pred coverage of alloc : {avg_alloc_frac:.1f}% (pred-enabled / allocated bands)"
@@ -1078,14 +1140,14 @@ class RMCFile(AudioFile):
             )
         self.fp.close()
 
-    def Encode(self, data, codingParams):
+    def Encode(self, data, codingParams, features: RMCFeatures):
         """
         Encodes multichannel audio data and returns a tuple containing
         the scale factors, mantissa bit allocations, quantized mantissas,
         and the overall scale factor for each channel.
         """
         # Passes encoding logic to the Encode function defined in the codec module
-        return codec.Encode(data, codingParams)
+        return codec.Encode(data, codingParams, features)
 
     def Decode(
         self,

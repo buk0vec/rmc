@@ -17,50 +17,55 @@ Awesome CLI for encoding/decoding RMC files.
 
 """
 
-import time  # just for printing elapsed time
-import numpy as np
-from rmcfile import *  # to get access to RMC file handling
-from pcmfile import *  # to get access to WAV file handling
-from simple_run import detectTransients
 from pathlib import Path
-from features import BLOCK_SWITCHING, SHORT_BLOCK_BITBOOST
+
+import numpy as np
+
+from features import RMCFeatures
+from pcmfile import *  # to get access to WAV file handling
+from rmcfile import *  # to get access to RMC file handling
+from simple_run import detectTransients
+
 
 def print_flavor():
     flavor = """
-⠀⠀⠀⠀⠀⢀⣼⣿⣆⠀⠀⠀    
+⠀⠀⠀⠀⠀⢀⣼⣿⣆⠀⠀⠀
 ⠀⠀⠀⠀⠀⣾⡿⠛⢻⡆⠀⠀
 ⠀⠀⠀⠀⢰⣿⠀⠀⢸⡇⠀⠀
-⠀⠀⠀⠀⠸⡇⠀⢀⣾⠇⠀⠀          ___           ___           ___     
-⠀⠀⠀⠀⠀⣿⣤⣿⡟⠀⠀⠀         /\\  \\         /\\__\\         /\\  \\    
-⠀⠀⠀⠀⣠⣾⣿⣿⠀⠀⠀⠀        /::\\  \\       /::|  |       /::\\  \\ 
-⠀⣴⣿⡿⠋⠀⢻⡉⠀⠀⠀⠀       /:/\\:\\  \\     /:|:|  |      /:/\\:\\  \\  
-⢰⣿⡟⠀⢀⣴⣿⣿⣿⣿⣦⠀      /::\\~\\:\\  \\   /:/|:|__|__   /:/  \\:\\  \\ 
-⢸⡿⠀⠀⣿⠟⠛⣿⠟⠛⣿⣧     /:/\\:\\ \\:\\__\\ /:/ |::::\\__\\ /:/__/ \\:\\__\\ 
-⠘⣿⡀⠀⢿⡀⠀⢻⣤⠖⢻⡿     \\/_|::\\/:/  / \\/__/~~/:/  / \\:\\  \\  \\/__/    
-⠀⠘⢷⣄⠈⠙⠦⠸⡇⢀⡾⠃        |:|::/  /        /:/  /   \\:\\  \\      
-⠀⠀⠀⠙⠛⠶⠤⠶⣿⠉⠀⠀        |:|\\/__/        /:/  /     \\:\\  \\          
-⠀⠀⠀⠀⠀⠀⠀⠀⢹⡇⠀⠀        |:|  |         /:/  /       \\:\\__\\    
-⠀⠀⢀⣴⣾⣿⣆⠀⠈⣧⠀⠀         \\|__|         \\/__/         \\/__/   
+⠀⠀⠀⠀⠸⡇⠀⢀⣾⠇⠀⠀          ___           ___           ___
+⠀⠀⠀⠀⠀⣿⣤⣿⡟⠀⠀⠀         /\\  \\         /\\__\\         /\\  \\
+⠀⠀⠀⠀⣠⣾⣿⣿⠀⠀⠀⠀        /::\\  \\       /::|  |       /::\\  \\
+⠀⣴⣿⡿⠋⠀⢻⡉⠀⠀⠀⠀       /:/\\:\\  \\     /:|:|  |      /:/\\:\\  \\
+⢰⣿⡟⠀⢀⣴⣿⣿⣿⣿⣦⠀      /::\\~\\:\\  \\   /:/|:|__|__   /:/  \\:\\  \\
+⢸⡿⠀⠀⣿⠟⠛⣿⠟⠛⣿⣧     /:/\\:\\ \\:\\__\\ /:/ |::::\\__\\ /:/__/ \\:\\__\\
+⠘⣿⡀⠀⢿⡀⠀⢻⣤⠖⢻⡿     \\/_|::\\/:/  / \\/__/~~/:/  / \\:\\  \\  \\/__/
+⠀⠘⢷⣄⠈⠙⠦⠸⡇⢀⡾⠃        |:|::/  /        /:/  /   \\:\\  \\
+⠀⠀⠀⠙⠛⠶⠤⠶⣿⠉⠀⠀        |:|\\/__/        /:/  /     \\:\\  \\
+⠀⠀⠀⠀⠀⠀⠀⠀⢹⡇⠀⠀        |:|  |         /:/  /       \\:\\__\\
+⠀⠀⢀⣴⣾⣿⣆⠀⠈⣧⠀⠀         \\|__|         \\/__/         \\/__/
 ⠀⠀⠈⣿⣿⡿⠃⠀⣰⡏⠀⠀
-⠀⠀⠀⠈⣙⠓⠒⠚⠉⠀⠀ 
+⠀⠀⠀⠈⣙⠓⠒⠚⠉⠀⠀
 """
     print(flavor)
 
-def Encode(inFilename,
-            codedFilename=None,
-            nMDCTLines=1024,
-            nScaleBits=5,
-            nMantSizeBits=5,
-            kbps=128,
-            targetBitsPerSample=None,
-            tempo: int = 120,
-            verbose: bool = False,
-    ):
+
+def Encode(
+    inFilename,
+    features: RMCFeatures,
+    codedFilename=None,
+    nMDCTLines=1024,
+    nScaleBits=5,
+    nMantSizeBits=5,
+    kbps=128,
+    targetBitsPerSample=None,
+    tempo: int = 120,
+    verbose: bool = False,
+):
     if codedFilename is None:
         codedFilename = f"{Path(inFilename).stem}.rmc"
 
     inFile = PCMFile(inFilename)
-    outFile = RMCFile(codedFilename)
+    outFile = RMCFile(codedFilename, features=features)
 
     codingParams = inFile.OpenForReading()
 
@@ -78,7 +83,7 @@ def Encode(inFilename,
     if verbose:
         print(f"\nEncoding {inFilename} -> {codedFilename} at {kbps} kb/s")
 
-    if BLOCK_SWITCHING:
+    if features.BLOCK_SWITCHING:
         transient_map = detectTransients(inFilename, verbose=False)
         # Shift transient map back by 1 block for lookahead: the START block must
         # precede the transient so that SHORT blocks capture the actual attack.
@@ -86,7 +91,9 @@ def Encode(inFilename,
         # bass content lands in SHORT blocks with terrible low-frequency resolution.
         transient_map = {max(x - 1, 0): 0 for x in transient_map}
         if verbose:
-            print(f"TransientDetection complete: found transients in {len(transient_map)} blocks")
+            print(
+                f"TransientDetection complete: found transients in {len(transient_map)} blocks"
+            )
     else:
         transient_map = {}
         if verbose:
@@ -97,19 +104,29 @@ def Encode(inFilename,
 
     # Adjust targetBitsPerSample so SHORT blocks' boosted budget
     # doesn't push the file over the target bitrate.
-    total_blocks = int(np.ceil(codingParams.numSamples / nMDCTLines)) + 1  # +1 for flush block
+    total_blocks = (
+        int(np.ceil(codingParams.numSamples / nMDCTLines)) + 1
+    )  # +1 for flush block
     n_short = len(transient_map)
     n_long = total_blocks - n_short
-    short_budget_factor = 2.0 if SHORT_BLOCK_BITBOOST else 1.0  # must match codec.py
+    short_budget_factor = (
+        2.0 if features.SHORT_BLOCK_BITBOOST else 1.0
+    )  # must match codec.py
     if n_short > 0 and short_budget_factor != 1.0:
-        adjusted_bps = targetBitsPerSample * total_blocks / (n_long + short_budget_factor * n_short)
+        adjusted_bps = (
+            targetBitsPerSample
+            * total_blocks
+            / (n_long + short_budget_factor * n_short)
+        )
         if verbose:
-            print(f"Adjusted bps: {targetBitsPerSample:.3f} -> {adjusted_bps:.3f} "
-                  f"({n_short} short / {total_blocks} total blocks)")
+            print(
+                f"Adjusted bps: {targetBitsPerSample:.3f} -> {adjusted_bps:.3f} "
+                f"({n_short} short / {total_blocks} total blocks)"
+            )
         codingParams.targetBitsPerSample = adjusted_bps
     else:
         codingParams.targetBitsPerSample = targetBitsPerSample
-    
+
     # open the output file
     outFile.OpenForWriting(codingParams)  # (includes writing header)
     # Read the input file and pass its data to the output file to be written
@@ -117,11 +134,13 @@ def Encode(inFilename,
     processed_samples = 0
 
     from tqdm import tqdm
+
     pbar = tqdm(total=total_samples, unit="samp", desc="Encoding", disable=not verbose)
 
     while True:
         data = inFile.ReadDataBlock(codingParams)
-        if not data: break
+        if not data:
+            break
         outFile.WriteDataBlock(data, codingParams)
         n = len(data[0])
         processed_samples += n
@@ -131,17 +150,20 @@ def Encode(inFilename,
     inFile.Close(codingParams)
     outFile.Close(codingParams)
 
-def Decode(inFilename,
-           outFilename=None,
-           verbose: bool = False,
-    ):
+
+def Decode(
+    inFilename,
+    features: RMCFeatures,
+    outFilename=None,
+    verbose: bool = False,
+):
     if outFilename is None:
         outFilename = f"{Path(inFilename).stem}.wav"
 
     if verbose:
         print(f"\nDecoding {inFilename} -> {outFilename}")
 
-    inFile = RMCFile(inFilename)
+    inFile = RMCFile(inFilename, features=features)
     outFile = PCMFile(outFilename)
 
     codingParams = inFile.OpenForReading()
@@ -153,11 +175,13 @@ def Decode(inFilename,
     processed_samples = 0
 
     from tqdm import tqdm
+
     pbar = tqdm(total=total_samples, unit="samp", desc="Decoding", disable=not verbose)
 
     while True:
         data = inFile.ReadDataBlock(codingParams)
-        if not data: break
+        if not data:
+            break
         outFile.WriteDataBlock(data, codingParams)
         n = len(data[0])
         processed_samples += n
@@ -175,15 +199,35 @@ if __name__ == "__main__":
     parser.add_argument("-v", "--verbose", action="store_true")
 
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("-c", "--compress", nargs="+", metavar="FILE",
-                      help="Encode: input.wav [output.rmc]")
-    mode.add_argument("-d", "--decompress", nargs="+", metavar="FILE",
-                      help="Decode: input.rmc [output.wav]")
+    mode.add_argument(
+        "-c",
+        "--compress",
+        nargs="+",
+        metavar="FILE",
+        help="Encode: input.wav [output.rmc]",
+    )
+    mode.add_argument(
+        "-d",
+        "--decompress",
+        nargs="+",
+        metavar="FILE",
+        help="Decode: input.rmc [output.wav]",
+    )
 
-    parser.add_argument("-b", "--bitrate", type=int, default=128,
-                        help="Bitrate in kbps (encode only, default: 128)")
-    parser.add_argument("-t", "--tempo", type=int, default=120,
-                        help="Tempo in BPM (encode only, default: 120)")
+    parser.add_argument(
+        "-b",
+        "--bitrate",
+        type=int,
+        default=128,
+        help="Bitrate in kbps (encode only, default: 128)",
+    )
+    parser.add_argument(
+        "-t",
+        "--tempo",
+        type=int,
+        default=120,
+        help="Tempo in BPM (encode only, default: 120)",
+    )
 
     args = parser.parse_args()
 
@@ -192,9 +236,15 @@ if __name__ == "__main__":
     if args.compress:
         inFile = args.compress[0]
         outFile = args.compress[1] if len(args.compress) > 1 else None
-        Encode(inFile, codedFilename=outFile, kbps=args.bitrate,
-               tempo=args.tempo, verbose=args.verbose)
+        Encode(
+            inFile,
+            RMCFeatures(),
+            codedFilename=outFile,
+            kbps=args.bitrate,
+            tempo=args.tempo,
+            verbose=args.verbose,
+        )
     else:
         inFile = args.decompress[0]
         outFile = args.decompress[1] if len(args.decompress) > 1 else None
-        Decode(inFile, outFilename=outFile, verbose=args.verbose)
+        Decode(inFile, RMCFeatures(), outFilename=outFile, verbose=args.verbose)

@@ -1,11 +1,9 @@
 import numpy as np
+import scipy.fft as _scipy_fft
 from scipy.signal import correlate as _fft_correlate
 
 from blockswitching import LONG, WindowForBlockType
-from features import (
-    COMPLEX_PREDICTION,
-    PRED_EXTENDED_RANGE,
-)
+from features import RMCFeatures
 from mdct import MDCT
 
 PRED_MAP = {
@@ -74,7 +72,9 @@ def phase_idx_to_radians(idx):
 FRACTIONAL_CENTER_IDX = 2
 
 
-def get_best_region(mdct_X, input_pcm, coding_params, buffer, block_type=LONG):
+def get_best_region(
+    mdct_X, input_pcm, coding_params, buffer, features: RMCFeatures, block_type=LONG
+):
     """Select the best prediction region, optionally refining with fractional delay."""
     halfN = coding_params.nMDCTLines
     N = 2 * halfN
@@ -94,13 +94,14 @@ def get_best_region(mdct_X, input_pcm, coding_params, buffer, block_type=LONG):
             :halfN
         ]
         mdct_P = mdct_P_cplx.real
-        if COMPLEX_PREDICTION:
+        if features.COMPLEX_PREDICTION:
             mdst_P = mdct_P_cplx.imag
+            mdct_X_real = mdct_X.real if np.iscomplexobj(mdct_X) else mdct_X
             # Vectorized per-band sums via reduceat (bands tile [0, halfN))
             PP = mdct_P * mdct_P
             DD = mdst_P * mdst_P
-            XP = mdct_X * mdct_P
-            XD = mdct_X * mdst_P
+            XP = mdct_X_real * mdct_P
+            XD = mdct_X_real * mdst_P
             PD = mdct_P * mdst_P
             sum_PP = np.add.reduceat(PP, lo_arr)
             sum_DD = np.add.reduceat(DD, lo_arr)
@@ -135,12 +136,13 @@ def get_best_region(mdct_X, input_pcm, coding_params, buffer, block_type=LONG):
 
             a_line = np.repeat(alpha_qs * np.cos(phase_qs), nLines_arr)
             b_line = np.repeat(alpha_qs * np.sin(phase_qs), nLines_arr)
-            residual_mdct = mdct_X - a_line * mdct_P + b_line * mdst_P
+            residual_mdct = mdct_X_real - a_line * mdct_P + b_line * mdst_P
             pcm_residual = input_pcm
         else:
             p_energy_mdct = np.dot(mdct_P, mdct_P)
             if p_energy_mdct > 0:
-                alpha_star = np.dot(mdct_X, mdct_P) / p_energy_mdct
+                mdct_X_real = mdct_X.real if np.iscomplexobj(mdct_X) else mdct_X
+                alpha_star = np.dot(mdct_X_real, mdct_P) / p_energy_mdct
                 base_idx = int(np.argmin(np.abs(GAIN_TABLE - alpha_star)))
                 base_gain = float(GAIN_TABLE[base_idx])
             else:
@@ -152,8 +154,12 @@ def get_best_region(mdct_X, input_pcm, coding_params, buffer, block_type=LONG):
             pcm_residual = input_pcm - alpha_qs * candidate_time
 
         # Vectorized scoring via reduceat
-        XX = np.add.reduceat(mdct_X * mdct_X, lo_arr)
-        RR = np.add.reduceat(residual_mdct * residual_mdct, lo_arr)
+        mdct_X_real = mdct_X.real if np.iscomplexobj(mdct_X) else mdct_X
+        residual_real = (
+            residual_mdct.real if np.iscomplexobj(residual_mdct) else residual_mdct
+        )
+        XX = np.add.reduceat(mdct_X_real * mdct_X_real, lo_arr)
+        RR = np.add.reduceat(residual_real * residual_real, lo_arr)
         orig_rms_v = np.sqrt(XX / nLines_arr)
         res_rms_v = np.sqrt(RR / nLines_arr)
         valid_v = orig_rms_v > 0
@@ -170,7 +176,7 @@ def get_best_region(mdct_X, input_pcm, coding_params, buffer, block_type=LONG):
         return {
             "pcm_residual": pcm_residual,
             "mdct_P": mdct_P,
-            "mdst_P": mdst_P if COMPLEX_PREDICTION else None,
+            "mdst_P": mdst_P if features.COMPLEX_PREDICTION else None,
             "alpha_idxs": alpha_idxs,
             "alpha_qs": alpha_qs,
             "phase_idxs": phase_idxs,
@@ -188,7 +194,7 @@ def get_best_region(mdct_X, input_pcm, coding_params, buffer, block_type=LONG):
 
     range_types = (
         ("quarter", "half", "bar", "2bar", "4bar")
-        if PRED_EXTENDED_RANGE
+        if features.PRED_EXTENDED_RANGE
         else ("quarter", "half", "bar")
     )
     results = {}
@@ -201,6 +207,7 @@ def get_best_region(mdct_X, input_pcm, coding_params, buffer, block_type=LONG):
             continue
         qn_multiplier = pred_type_to_samples(range_type, coding_params)
         center_offset = len(buffer) - halfN - qn_multiplier
+
         # Clamp search_start to the oldest valid (non-zero) sample in the buffer.
         search_start = max(center_offset - search_range, valid_from)
         search_end = center_offset + search_range

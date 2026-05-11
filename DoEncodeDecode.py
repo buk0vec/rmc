@@ -4,6 +4,7 @@
 
 import time
 
+from features import RMCFeatures
 from xrmc import Decode, Encode
 
 
@@ -17,6 +18,7 @@ def EncodeDecode(
     targetBitsPerSample=2.4,
     tempo: int = 120,
     verbose: bool = True,
+    features: RMCFeatures = RMCFeatures(),
 ):
     """Encodes input WAV file inFilename into perceptually coded file
     codedFilename and then decodes that file into output WAV file outFilename.
@@ -39,6 +41,7 @@ def EncodeDecode(
 
     Encode(
         inFilename,
+        features,
         codedFilename=codedFilename,
         nMDCTLines=nMDCTLines,
         nScaleBits=nScaleBits,
@@ -50,6 +53,7 @@ def EncodeDecode(
 
     Decode(
         codedFilename,
+        features,
         outFilename=outFilename,
         verbose=verbose,
     )
@@ -61,12 +65,39 @@ def EncodeDecode(
 
 
 if __name__ == "__main__":
+    # Base feature set
+    features = RMCFeatures()
+    # Feature set w/ prediction enabled
+    features_pred = RMCFeatures(PREDICTION=True)
     EncodeDecode(
         inFilename="inputs/Van_124.wav",
         codedFilename="van_base.pac",
-        outFilename="van_124_base.wav",
+        outFilename="van_124_nopred.wav",
         targetBitsPerSample=80000 / 44100,
         tempo=124,
+        features=features,
     )
-    # EncodeDecode(inFilename='inputs/Van_124.wav', codedFilename='van_base.pac',
-    #              outFilename='van_124_B.wav', targetBitsPerSample=80000/44100, tempo=124)
+    EncodeDecode(
+        inFilename="inputs/Van_124.wav",
+        codedFilename="van_pred.pac",
+        outFilename="van_124_pred.wav",
+        targetBitsPerSample=80000 / 44100,
+        tempo=124,
+        features=features_pred,
+    )
+    # EncodeDecode(
+    #     inFilename="spiralsunfold.wav",
+    #     codedFilename="subase.pac",
+    #     outFilename="spirals_unfold_nopred.wav",
+    #     targetBitsPerSample=80000 / 44100,
+    #     tempo=130,
+    #     features=features,
+    # )
+    # EncodeDecode(
+    #     inFilename="spiralsunfold.wav",
+    #     codedFilename="supred.pac",
+    #     outFilename="spirals_unfold_pred.wav",
+    #     targetBitsPerSample=80000 / 44100,
+    #     tempo=130,
+    #     features=features_pred,
+    # )
