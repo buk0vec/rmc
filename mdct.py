@@ -15,6 +15,9 @@ import numpy as np
 import scipy.fft
 import timeit
 
+_mdct_twiddle_cache = {}
+_imdct_twiddle_cache = {}
+
 ### Problem 1.a ###
 def MDCTslow(data, a, b, isInverse=False):
     """
@@ -51,13 +54,18 @@ def MDCT(data, a, b, isInverse=False, return_complex=False):
 
     ### YOUR CODE STARTS HERE ###
     N = a + b
-    ks = np.arange(N // 2)
-    ns = np.arange(N)
-    n_0 = (b + 1) / 2
-    pre_twiddles = np.exp(-1j * np.pi * ns / N)
+    key = (a, b)
+    if key not in _mdct_twiddle_cache:
+        ns = np.arange(N)
+        ks = np.arange(N // 2)
+        n_0 = (b + 1) / 2
+        _mdct_twiddle_cache[key] = (
+            np.exp(-1j * np.pi * ns / N),
+            np.exp(-1j * 2 * np.pi / N * n_0 * (ks + 0.5)),
+        )
+    pre_twiddles, post_twiddles = _mdct_twiddle_cache[key]
     out = data * pre_twiddles
     out = scipy.fft.fft(out, norm="forward")
-    post_twiddles = np.exp(-1j * 2 * np.pi / N * n_0 * (ks + 0.5))
     out = out[:N // 2] * post_twiddles
     if return_complex:
         # out = (1/2)*(MDCT - j*MDST), so MDCT+j*MDST = 2*conj(out)
@@ -69,14 +77,19 @@ def IMDCT(data,a,b):
 
     ### YOUR CODE STARTS HERE ###
     N = a + b
-    ks = np.arange(N)
-    ns = np.arange(N)
-    n_0 = (b + 1) / 2
+    key = (a, b)
+    if key not in _imdct_twiddle_cache:
+        ks = np.arange(N)
+        ns = np.arange(N)
+        n_0 = (b + 1) / 2
+        _imdct_twiddle_cache[key] = (
+            np.exp(2j * np.pi / N * ks * n_0),
+            np.exp(1j * np.pi / N * (ns + n_0)),
+        )
+    pre_twiddles, post_twiddles = _imdct_twiddle_cache[key]
     out = np.concatenate([data, -np.flip(data)])
-    pre_twiddles = np.exp(2j * np.pi / N * ks * n_0)
     out = out * pre_twiddles
     out = scipy.fft.ifft(out, norm="forward")
-    post_twiddles = np.exp(1j * np.pi/N * (ns + n_0))
     out = post_twiddles * out
     return out.real
     ### YOUR CODE ENDS HERE ###

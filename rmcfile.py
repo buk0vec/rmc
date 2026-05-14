@@ -734,20 +734,13 @@ class RMCFile(AudioFile):
                 )
                 # If we found a good enough region for prediction
                 if range_type is not None:
-                    # Per-band complex residual
-                    residual_full = np.empty(halfN_t)
-                    for iBand in range(sfBands_pred.nBands):
-                        lo = sfBands_pred.lowerLine[iBand]
-                        hi = sfBands_pred.upperLine[iBand] + 1
-                        a_b = alpha_q[iBand] * np.cos(
-                            phase_idx_to_radians(phase_idx[iBand])
-                        )
-                        b_b = alpha_q[iBand] * np.sin(
-                            phase_idx_to_radians(phase_idx[iBand])
-                        )
-                        residual_full[lo:hi] = (
-                            mdct_X[lo:hi] - a_b * mdct_P[lo:hi] + b_b * mdst_P[lo:hi]
-                        )
+                    # Per-band complex residual (vectorized over all bands)
+                    _phases = phase_idx * (np.pi / 8.0) - np.pi
+                    _a_vec = alpha_q * np.cos(_phases)
+                    _b_vec = alpha_q * np.sin(_phases)
+                    _a_line = np.repeat(_a_vec, sfBands_pred.nLines)
+                    _b_line = np.repeat(_b_vec, sfBands_pred.nLines)
+                    residual_full = mdct_X - _a_line * mdct_P + _b_line * mdst_P
                     # Per-band enable: apply prediction only where it reduces the signal
                     enable_f = np.zeros(sfBands_pred.nBands, dtype=bool)
                     enable_m = np.zeros(halfN_t)
@@ -794,20 +787,11 @@ class RMCFile(AudioFile):
                         correction = None
                     else:
                         # Per-band MDCT-domain correction: subtract prediction in enabled bands.
-                        correction = np.zeros(halfN_t)
-                        for iBand in range(sfBands_pred.nBands):
-                            if enable_f[iBand]:
-                                lo = sfBands_pred.lowerLine[iBand]
-                                hi = sfBands_pred.upperLine[iBand] + 1
-                                a_b = alpha_q[iBand] * np.cos(
-                                    phase_idx_to_radians(phase_idx[iBand])
-                                )
-                                b_b = alpha_q[iBand] * np.sin(
-                                    phase_idx_to_radians(phase_idx[iBand])
-                                )
-                                correction[lo:hi] = -(
-                                    a_b * mdct_P[lo:hi] - b_b * mdst_P[lo:hi]
-                                )
+                        _a_vec_e = alpha_q * np.cos(_phases) * enable_f
+                        _b_vec_e = alpha_q * np.sin(_phases) * enable_f
+                        _a_line_e = np.repeat(_a_vec_e, sfBands_pred.nLines)
+                        _b_line_e = np.repeat(_b_vec_e, sfBands_pred.nLines)
+                        correction = -(_a_line_e * mdct_P - _b_line_e * mdst_P)
                 else:
                     enable_f = np.zeros(sfBands_pred.nBands, dtype=bool)
                     enable_m = np.zeros(halfN_t)
@@ -977,18 +961,16 @@ class RMCFile(AudioFile):
                 )
                 if pred_mdcts[iCh] is not None:
                     _mdst_pred = pred_mdsts[iCh]
-                    scaled_pred = np.zeros(halfN_med)
                     _aq = alpha_qs[iCh]
                     _pi = phase_idxs[iCh]
-                    for iBand in range(sfBands_pred.nBands):
-                        if enable_flags_list[iCh][iBand]:
-                            lo = sfBands_pred.lowerLine[iBand]
-                            hi = sfBands_pred.upperLine[iBand] + 1
-                            a_b = _aq[iBand] * np.cos(phase_idx_to_radians(_pi[iBand]))
-                            b_b = _aq[iBand] * np.sin(phase_idx_to_radians(_pi[iBand]))
-                            scaled_pred[lo:hi] = (
-                                a_b * pred_mdcts[iCh][lo:hi] - b_b * _mdst_pred[lo:hi]
-                            )
+                    _ef = enable_flags_list[iCh]
+                    _ph = _pi * (np.pi / 8.0) - np.pi
+                    _av = _aq * np.cos(_ph) * _ef
+                    _bv = _aq * np.sin(_ph) * _ef
+                    scaled_pred = (
+                        np.repeat(_av, sfBands_pred.nLines) * pred_mdcts[iCh]
+                        - np.repeat(_bv, sfBands_pred.nLines) * _mdst_pred
+                    )
                 else:
                     scaled_pred = None
                 decodedData = codec.Decode(
@@ -1013,18 +995,16 @@ class RMCFile(AudioFile):
                 )
                 if pred_mdcts[iCh] is not None:
                     _mdst_pred = pred_mdsts[iCh]
-                    scaled_pred = np.zeros(halfN_used)
                     _aq = alpha_qs[iCh]
                     _pi = phase_idxs[iCh]
-                    for iBand in range(sfBands_pred.nBands):
-                        if enable_flags_list[iCh][iBand]:
-                            lo = sfBands_pred.lowerLine[iBand]
-                            hi = sfBands_pred.upperLine[iBand] + 1
-                            a_b = _aq[iBand] * np.cos(phase_idx_to_radians(_pi[iBand]))
-                            b_b = _aq[iBand] * np.sin(phase_idx_to_radians(_pi[iBand]))
-                            scaled_pred[lo:hi] = (
-                                a_b * pred_mdcts[iCh][lo:hi] - b_b * _mdst_pred[lo:hi]
-                            )
+                    _ef = enable_flags_list[iCh]
+                    _ph = _pi * (np.pi / 8.0) - np.pi
+                    _av = _aq * np.cos(_ph) * _ef
+                    _bv = _aq * np.sin(_ph) * _ef
+                    scaled_pred = (
+                        np.repeat(_av, sfBands_pred.nLines) * pred_mdcts[iCh]
+                        - np.repeat(_bv, sfBands_pred.nLines) * _mdst_pred
+                    )
                 else:
                     scaled_pred = None
                 decodedData = codec.Decode(
@@ -1041,18 +1021,16 @@ class RMCFile(AudioFile):
                 )
                 if pred_mdcts[iCh] is not None:
                     mdst_pred = pred_mdsts[iCh]
-                    scaled_pred = np.zeros(halfN)
-                    _aq = alpha_qs[iCh]  # per-band gain array
-                    _pi = phase_idxs[iCh]  # per-band phase index array
-                    for iBand in range(sfBands_pred.nBands):
-                        if enable_flags_list[iCh][iBand]:
-                            lo = sfBands_pred.lowerLine[iBand]
-                            hi = sfBands_pred.upperLine[iBand] + 1
-                            a_b = _aq[iBand] * np.cos(phase_idx_to_radians(_pi[iBand]))
-                            b_b = _aq[iBand] * np.sin(phase_idx_to_radians(_pi[iBand]))
-                            scaled_pred[lo:hi] = (
-                                a_b * pred_mdcts[iCh][lo:hi] - b_b * mdst_pred[lo:hi]
-                            )
+                    _aq = alpha_qs[iCh]
+                    _pi = phase_idxs[iCh]
+                    _ef = enable_flags_list[iCh]
+                    _ph = _pi * (np.pi / 8.0) - np.pi
+                    _av = _aq * np.cos(_ph) * _ef
+                    _bv = _aq * np.sin(_ph) * _ef
+                    scaled_pred = (
+                        np.repeat(_av, sfBands_pred.nLines) * pred_mdcts[iCh]
+                        - np.repeat(_bv, sfBands_pred.nLines) * mdst_pred
+                    )
                 else:
                     scaled_pred = None
                 decodedData = codec.Decode(
