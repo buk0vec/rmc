@@ -29,6 +29,9 @@ MEDIUM = 4   # Cascade intermediate: rising-sine(a) | falling-sine(b)
 # Number of short blocks that replace one long block
 N_SHORT_BLOCKS = 8
 
+# Maximum k_attack value (0..15); limits max MEDIUM window size in the AC-2A cascade
+K_ATTACK_MAX = 15
+
 
 # ---------------------------------------------------------------------------
 # Transient detection

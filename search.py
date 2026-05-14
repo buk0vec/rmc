@@ -3,7 +3,6 @@ import scipy.fft as _scipy_fft
 from scipy.fft import irfft as _irfft, next_fast_len as _next_fast_len, rfft as _rfft
 
 from blockswitching import LONG, START, STOP, MEDIUM, WindowForBlockType
-from features import RMCFeatures
 from mdct import MDCT
 
 PRED_MAP = {
@@ -15,19 +14,7 @@ PRED_MAP = {
     "4bar": 5,
 }
 
-# TODO: Investigate whether our gain tables should actually be going this low - certainly
-# low gains mean that we shouldn't waste time with prediction, right?
-
-# Gain table, 13 values, 4-bit index. Tuned to cover low-magnitude wins and
-# extend headroom for high-band prediction while increasing resolution through
-# the 0.55–1.3 corridor where most optimal gains land.
-GAIN_TABLE = np.array(
-    [0.06, 0.09, 0.13, 0.18, 0.24, 0.32, 0.42, 0.55, 0.75, 1.02, 1.36, 1.85, 2.50]
-)
-
-# 3-bit (8-entry) gain table for COMPLEX_PREDICTION — log-spaced over same range.
-# Saves 1 bit/enabled band vs the 13-entry table; precision sweep shows +1.1 dB
-# quantization penalty vs optimal, down from +0.75 dB for 4b, acceptable trade.
+# 3-bit (8-entry) gain table for complex prediction — log-spaced over [0.06, 2.50].
 COMPLEX_GAIN_TABLE = np.exp(np.linspace(np.log(0.06), np.log(2.50), 8))
 
 
@@ -78,10 +65,10 @@ FRACTIONAL_CENTER_IDX = 2
 
 
 def get_best_region(
-    mdct_X, input_pcm, coding_params, buffer, features: RMCFeatures, block_type=LONG,
+    mdct_X, input_pcm, coding_params, buffer, block_type=LONG,
     cascade_a=None, cascade_b=None, sfBands=None
 ):
-    """Select the best prediction region, optionally refining with fractional delay."""
+    """Select the best prediction region using per-band complex (MDCT+MDST) gains."""
     halfN = coding_params.nMDCTLines
     N = 2 * halfN
     N_short = 2 * coding_params.nMDCTLines_short
@@ -97,7 +84,6 @@ def get_best_region(
         halfN_t = halfN
 
     # Use per-block sfBands so scoring, LS, and band loops all work natively at halfN_t.
-    # For LONG blocks this equals coding_params.sfBands; for START/STOP/MEDIUM it's smaller.
     if sfBands is None:
         sfBands = coding_params.sfBands
 
@@ -119,67 +105,51 @@ def get_best_region(
     def evaluate_candidate(candidate_time: np.ndarray):
         mdct_P_cplx = MDCT(window * candidate_time, ca, cb, return_complex=True)[:halfN_t]
         mdct_P = mdct_P_cplx.real
-        if features.COMPLEX_PREDICTION:
-            mdst_P = mdct_P_cplx.imag
-            mdct_X_real = _mdct_X_raw
-            # Vectorized per-band sums via reduceat (bands tile [0, halfN))
-            PP = mdct_P * mdct_P
-            DD = mdst_P * mdst_P
-            XP = mdct_X_real * mdct_P
-            XD = mdct_X_real * mdst_P
-            PD = mdct_P * mdst_P
-            sum_PP = np.add.reduceat(PP, lo_arr)
-            sum_DD = np.add.reduceat(DD, lo_arr)
-            sum_XP = np.add.reduceat(XP, lo_arr)
-            sum_XD = np.add.reduceat(XD, lo_arr)
-            sum_PD = np.add.reduceat(PD, lo_arr)
-            # Exact per-band LS: solve [sum_PP,-sum_PD;-sum_PD,sum_DD][a;b]=[sum_XP;-sum_XD]
-            det = sum_PP * sum_DD - sum_PD**2
-            valid_zz = det > 1e-12
-            safe_det = np.where(valid_zz, det, 1.0)
-            a_opt = np.where(
-                valid_zz, (sum_DD * sum_XP - sum_PD * sum_XD) / safe_det, 0.0
-            )
-            b_opt = np.where(
-                valid_zz, (sum_PD * sum_XP - sum_PP * sum_XD) / safe_det, 0.0
-            )
-            mag_v = np.where(
-                valid_zz, np.sqrt(a_opt**2 + b_opt**2), COMPLEX_GAIN_TABLE[4]
-            )
-            phase_v = np.where(valid_zz, np.arctan2(b_opt, a_opt), 0.0)
-            # Vectorized gain quantization (3-bit COMPLEX_GAIN_TABLE)
-            alpha_idxs = np.argmin(
-                np.abs(COMPLEX_GAIN_TABLE[np.newaxis, :] - mag_v[:, np.newaxis]), axis=1
-            ).astype(np.int32)
-            alpha_qs = COMPLEX_GAIN_TABLE[alpha_idxs]
-            # Vectorized phase quantization
-            phase_norm = np.angle(np.exp(1j * phase_v))
-            phase_idxs = (
-                np.round((phase_norm + np.pi) * 8.0 / np.pi).astype(np.int32)
-            ) % 16
-            phase_qs = phase_idxs * (np.pi / 8.0) - np.pi
+        mdst_P = mdct_P_cplx.imag
+        mdct_X_real = _mdct_X_raw
+        # Vectorized per-band sums via reduceat (bands tile [0, halfN))
+        PP = mdct_P * mdct_P
+        DD = mdst_P * mdst_P
+        XP = mdct_X_real * mdct_P
+        XD = mdct_X_real * mdst_P
+        PD = mdct_P * mdst_P
+        sum_PP = np.add.reduceat(PP, lo_arr)
+        sum_DD = np.add.reduceat(DD, lo_arr)
+        sum_XP = np.add.reduceat(XP, lo_arr)
+        sum_XD = np.add.reduceat(XD, lo_arr)
+        sum_PD = np.add.reduceat(PD, lo_arr)
+        # Exact per-band LS: solve [sum_PP,-sum_PD;-sum_PD,sum_DD][a;b]=[sum_XP;-sum_XD]
+        det = sum_PP * sum_DD - sum_PD**2
+        valid_zz = det > 1e-12
+        safe_det = np.where(valid_zz, det, 1.0)
+        a_opt = np.where(
+            valid_zz, (sum_DD * sum_XP - sum_PD * sum_XD) / safe_det, 0.0
+        )
+        b_opt = np.where(
+            valid_zz, (sum_PD * sum_XP - sum_PP * sum_XD) / safe_det, 0.0
+        )
+        mag_v = np.where(
+            valid_zz, np.sqrt(a_opt**2 + b_opt**2), COMPLEX_GAIN_TABLE[4]
+        )
+        phase_v = np.where(valid_zz, np.arctan2(b_opt, a_opt), 0.0)
+        # Vectorized gain quantization (3-bit COMPLEX_GAIN_TABLE)
+        alpha_idxs = np.argmin(
+            np.abs(COMPLEX_GAIN_TABLE[np.newaxis, :] - mag_v[:, np.newaxis]), axis=1
+        ).astype(np.int32)
+        alpha_qs = COMPLEX_GAIN_TABLE[alpha_idxs]
+        # Vectorized phase quantization
+        phase_norm = np.angle(np.exp(1j * phase_v))
+        phase_idxs = (
+            np.round((phase_norm + np.pi) * 8.0 / np.pi).astype(np.int32)
+        ) % 16
+        phase_qs = phase_idxs * (np.pi / 8.0) - np.pi
 
-            a_line = np.repeat(alpha_qs * np.cos(phase_qs), nLines_arr)
-            b_line = np.repeat(alpha_qs * np.sin(phase_qs), nLines_arr)
-            residual_mdct = mdct_X_real - a_line * mdct_P + b_line * mdst_P
-            pcm_residual = input_pcm
-        else:
-            p_energy_mdct = np.dot(mdct_P, mdct_P)
-            if p_energy_mdct > 0:
-                mdct_X_real = _mdct_X_raw
-                alpha_star = np.dot(mdct_X_real, mdct_P) / p_energy_mdct
-                base_idx = int(np.argmin(np.abs(GAIN_TABLE - alpha_star)))
-                base_gain = float(GAIN_TABLE[base_idx])
-            else:
-                base_idx, base_gain = 5, float(GAIN_TABLE[5])
-            phase_idxs = 128
-
-            alpha_idxs, alpha_qs = base_idx, base_gain
-            residual_mdct = _mdct_X_raw - alpha_qs * mdct_P
-            pcm_residual = input_pcm - alpha_qs * candidate_time
+        a_line = np.repeat(alpha_qs * np.cos(phase_qs), nLines_arr)
+        b_line = np.repeat(alpha_qs * np.sin(phase_qs), nLines_arr)
+        residual_mdct = mdct_X_real - a_line * mdct_P + b_line * mdst_P
+        pcm_residual = input_pcm
 
         # Vectorized scoring via reduceat
-        mdct_X_real = _mdct_X_raw
         residual_real = (
             residual_mdct.real if np.iscomplexobj(residual_mdct) else residual_mdct
         )
@@ -201,7 +171,7 @@ def get_best_region(
         return {
             "pcm_residual": pcm_residual,
             "mdct_P": mdct_P_cplx.real,
-            "mdst_P": mdct_P_cplx.imag if features.COMPLEX_PREDICTION else None,
+            "mdst_P": mdct_P_cplx.imag,
             "alpha_idxs": alpha_idxs,
             "alpha_qs": alpha_qs,
             "phase_idxs": phase_idxs,
@@ -219,15 +189,10 @@ def get_best_region(
     _F_wsq   = _rfft(window_sq, n=_fft_n)
 
     # Compute how many samples of real audio are in the buffer (zeros at start).
-    # Prediction for range X starts as soon as X samples have been accumulated.
     buffer_fill = getattr(coding_params, "buffer_fill", len(buffer))
     valid_from = max(0, len(buffer) - buffer_fill)
 
-    range_types = (
-        ("quarter", "half", "bar", "2bar", "4bar")
-        if features.PRED_EXTENDED_RANGE
-        else ("quarter", "half", "bar")
-    )
+    range_types = ("quarter", "half", "bar", "2bar", "4bar")
     results = {}
     for range_type in range_types:
         if range_type == "bar" and coding_params.numSamplesBar == 0:

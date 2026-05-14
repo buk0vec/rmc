@@ -75,7 +75,7 @@ if __name__ == "__main__":
     features_bspred = RMCFeatures(PREDICTION=True, BLOCK_SWITCHING=True)
     EncodeDecode(
         inFilename="ringnoord.wav",
-        codedFilename="rn.pac",
+        codedFilename="rn.rmc",
         outFilename="rn_base.wav",
         targetBitsPerSample=80000 / 44100,
         tempo=164,
@@ -83,7 +83,7 @@ if __name__ == "__main__":
     )
     EncodeDecode(
         inFilename="ringnoord.wav",
-        codedFilename="rn_pred.pac",
+        codedFilename="rn_pred.rmc",
         outFilename="rn_pred.wav",
         targetBitsPerSample=80000 / 44100,
         tempo=164,
@@ -91,7 +91,7 @@ if __name__ == "__main__":
     )
     EncodeDecode(
         inFilename="ringnoord.wav",
-        codedFilename="rn_bs.pac",
+        codedFilename="rn_bs.rmc",
         outFilename="rn_bs.wav",
         targetBitsPerSample=80000 / 44100,
         tempo=164,
@@ -99,7 +99,7 @@ if __name__ == "__main__":
     )
     EncodeDecode(
         inFilename="ringnoord.wav",
-        codedFilename="rn_bspred.pac",
+        codedFilename="rn_bspred.rmc",
         outFilename="rn_bspred.wav",
         targetBitsPerSample=80000 / 44100,
         tempo=164,
