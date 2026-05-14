@@ -69,19 +69,39 @@ if __name__ == "__main__":
     features = RMCFeatures()
     # Feature set w/ prediction enabled
     features_pred = RMCFeatures(PREDICTION=True)
+    # Feature set w/ block switching enabled
+    features_bs = RMCFeatures(BLOCK_SWITCHING=True)
+    # Block switching and prediction
+    features_bspred = RMCFeatures(PREDICTION=True, BLOCK_SWITCHING=True)
     EncodeDecode(
-        inFilename="inputs/Van_124.wav",
-        codedFilename="van_base.pac",
-        outFilename="van_124_nopred.wav",
+        inFilename="ringnoord.wav",
+        codedFilename="rn.pac",
+        outFilename="rn_base.wav",
         targetBitsPerSample=80000 / 44100,
-        tempo=124,
+        tempo=164,
         features=features,
     )
     EncodeDecode(
-        inFilename="inputs/Van_124.wav",
-        codedFilename="van_pred.pac",
-        outFilename="van_124_pred.wav",
+        inFilename="ringnoord.wav",
+        codedFilename="rn_pred.pac",
+        outFilename="rn_pred.wav",
         targetBitsPerSample=80000 / 44100,
-        tempo=124,
+        tempo=164,
         features=features_pred,
+    )
+    EncodeDecode(
+        inFilename="ringnoord.wav",
+        codedFilename="rn_bs.pac",
+        outFilename="rn_bs.wav",
+        targetBitsPerSample=80000 / 44100,
+        tempo=164,
+        features=features_bs,
+    )
+    EncodeDecode(
+        inFilename="ringnoord.wav",
+        codedFilename="rn_bspred.pac",
+        outFilename="rn_bspred.wav",
+        targetBitsPerSample=80000 / 44100,
+        tempo=164,
+        features=features_bspred,
     )

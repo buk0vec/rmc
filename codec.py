@@ -286,6 +286,9 @@ def EncodeSingleChannel(data, codingParams, features: RMCFeatures):
                                              cascade_a=ca, cascade_b=cb) * timeSamples
         mdctLines = MDCT(mdctTimeSamples, ca, cb)[:halfN]
 
+        if codingParams._mdct_pred_correction is not None:
+            mdctLines = mdctLines + codingParams._mdct_pred_correction
+
         maxLine = np.max(np.abs(mdctLines))
         overallScale = ScaleFactor(maxLine, nScaleBits)
         mdctLines *= (1 << overallScale)

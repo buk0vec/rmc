@@ -1,8 +1,8 @@
 import numpy as np
 import scipy.fft as _scipy_fft
-from scipy.signal import correlate as _fft_correlate
+from scipy.fft import irfft as _irfft, next_fast_len as _next_fast_len, rfft as _rfft
 
-from blockswitching import LONG, WindowForBlockType
+from blockswitching import LONG, START, STOP, MEDIUM, WindowForBlockType
 from features import RMCFeatures
 from mdct import MDCT
 
@@ -61,7 +61,12 @@ def update_search_buffer(buf, new_data, halfN, N):
     buf[:-halfN] = buf[halfN:]
     buf[-halfN:] = 0
     buf[-N:] += new_data
-    buf[-N:] = np.clip(buf[-N:], -1, 1)
+    # Clip everything except the new incomplete right tail. With variable block
+    # sizes (block switching), a previous block may have left a larger incomplete
+    # tail; clipping buf[:-halfN] retroactively cleans those up too.
+    # The new tail (buf[-halfN:]) is left unclipped — it hasn't received the
+    # next block's left-half OLA contribution yet.
+    buf[:-halfN] = np.clip(buf[:-halfN], -1, 1)
 
 
 def phase_idx_to_radians(idx):
@@ -73,30 +78,50 @@ FRACTIONAL_CENTER_IDX = 2
 
 
 def get_best_region(
-    mdct_X, input_pcm, coding_params, buffer, features: RMCFeatures, block_type=LONG
+    mdct_X, input_pcm, coding_params, buffer, features: RMCFeatures, block_type=LONG,
+    cascade_a=None, cascade_b=None, sfBands=None
 ):
     """Select the best prediction region, optionally refining with fractional delay."""
     halfN = coding_params.nMDCTLines
     N = 2 * halfN
     N_short = 2 * coding_params.nMDCTLines_short
-    window = WindowForBlockType(block_type, N, N_short)
+
+    # Derive block-specific dimensions from cascade kwargs
+    if cascade_a is not None and cascade_b is not None:
+        ca, cb = cascade_a, cascade_b
+        N_t = ca + cb
+        halfN_t = N_t // 2
+    else:
+        ca = cb = halfN
+        N_t = N
+        halfN_t = halfN
+
+    # Use per-block sfBands so scoring, LS, and band loops all work natively at halfN_t.
+    # For LONG blocks this equals coding_params.sfBands; for START/STOP/MEDIUM it's smaller.
+    if sfBands is None:
+        sfBands = coding_params.sfBands
+
+    window = WindowForBlockType(
+        block_type, N, N_short,
+        cascade_a=ca if block_type in (STOP, MEDIUM) else None,
+        cascade_b=cb if block_type in (START, MEDIUM) else None,
+    )
     windowed_x = window * input_pcm
 
+    _mdct_X_raw = mdct_X.real if np.iscomplexobj(mdct_X) else mdct_X
+
     search_range = coding_params.search_range
-    sfBands = coding_params.sfBands
     nBands = sfBands.nBands
 
     lo_arr = sfBands.lowerLine
     nLines_arr = sfBands.nLines
 
     def evaluate_candidate(candidate_time: np.ndarray):
-        mdct_P_cplx = MDCT(window * candidate_time, halfN, halfN, return_complex=True)[
-            :halfN
-        ]
+        mdct_P_cplx = MDCT(window * candidate_time, ca, cb, return_complex=True)[:halfN_t]
         mdct_P = mdct_P_cplx.real
         if features.COMPLEX_PREDICTION:
             mdst_P = mdct_P_cplx.imag
-            mdct_X_real = mdct_X.real if np.iscomplexobj(mdct_X) else mdct_X
+            mdct_X_real = _mdct_X_raw
             # Vectorized per-band sums via reduceat (bands tile [0, halfN))
             PP = mdct_P * mdct_P
             DD = mdst_P * mdst_P
@@ -141,7 +166,7 @@ def get_best_region(
         else:
             p_energy_mdct = np.dot(mdct_P, mdct_P)
             if p_energy_mdct > 0:
-                mdct_X_real = mdct_X.real if np.iscomplexobj(mdct_X) else mdct_X
+                mdct_X_real = _mdct_X_raw
                 alpha_star = np.dot(mdct_X_real, mdct_P) / p_energy_mdct
                 base_idx = int(np.argmin(np.abs(GAIN_TABLE - alpha_star)))
                 base_gain = float(GAIN_TABLE[base_idx])
@@ -150,11 +175,11 @@ def get_best_region(
             phase_idxs = 128
 
             alpha_idxs, alpha_qs = base_idx, base_gain
-            residual_mdct = mdct_X - alpha_qs * mdct_P
+            residual_mdct = _mdct_X_raw - alpha_qs * mdct_P
             pcm_residual = input_pcm - alpha_qs * candidate_time
 
         # Vectorized scoring via reduceat
-        mdct_X_real = mdct_X.real if np.iscomplexobj(mdct_X) else mdct_X
+        mdct_X_real = _mdct_X_raw
         residual_real = (
             residual_mdct.real if np.iscomplexobj(residual_mdct) else residual_mdct
         )
@@ -175,8 +200,8 @@ def get_best_region(
 
         return {
             "pcm_residual": pcm_residual,
-            "mdct_P": mdct_P,
-            "mdst_P": mdst_P if features.COMPLEX_PREDICTION else None,
+            "mdct_P": mdct_P_cplx.real,
+            "mdst_P": mdct_P_cplx.imag if features.COMPLEX_PREDICTION else None,
             "alpha_idxs": alpha_idxs,
             "alpha_qs": alpha_qs,
             "phase_idxs": phase_idxs,
@@ -186,6 +211,12 @@ def get_best_region(
 
     window_sq = window**2
     f_xcorr = windowed_x * window
+
+    # Pre-compute FFTs of the fixed filter signals once; reused across all range types.
+    _filter_len = len(f_xcorr)
+    _fft_n = _next_fast_len(2 * search_range + N_t + _filter_len - 1)
+    _F_xcorr = _rfft(f_xcorr,   n=_fft_n)
+    _F_wsq   = _rfft(window_sq, n=_fft_n)
 
     # Compute how many samples of real audio are in the buffer (zeros at start).
     # Prediction for range X starts as soon as X samples have been accumulated.
@@ -206,26 +237,25 @@ def get_best_region(
         if range_type == "4bar" and getattr(coding_params, "numSamples4Bar", 0) == 0:
             continue
         qn_multiplier = pred_type_to_samples(range_type, coding_params)
-        center_offset = len(buffer) - halfN - qn_multiplier
+        center_offset = len(buffer) - halfN_t - qn_multiplier
 
         # Clamp search_start to the oldest valid (non-zero) sample in the buffer.
         search_start = max(center_offset - search_range, valid_from)
         search_end = center_offset + search_range
-        if search_start > search_end or search_end + N > len(buffer):
+        if search_start > search_end or search_end + N_t > len(buffer):
             continue
 
         s0 = max(search_start, 0)
-        s1 = min(search_end + N, len(buffer))
+        s1 = min(search_end + N_t, len(buffer))
         buf_slice = buffer[s0:s1]
 
-        xcorr = _fft_correlate(buf_slice, f_xcorr, mode="valid", method="fft")
-        power_xcorr = _fft_correlate(
-            buf_slice**2, window_sq, mode="valid", method="fft"
-        )
+        _vlen = len(buf_slice) - _filter_len + 1
+        xcorr       = _irfft(_rfft(buf_slice,      n=_fft_n) * np.conj(_F_xcorr), n=_fft_n)[:_vlen]
+        power_xcorr = _irfft(_rfft(buf_slice**2,   n=_fft_n) * np.conj(_F_wsq),   n=_fft_n)[:_vlen]
 
         # Slice-relative offset k → absolute buffer offset k + s0.
         offsets = np.arange(search_start, search_end + 1)
-        valid_m = (offsets >= 0) & (offsets + N <= len(buffer))
+        valid_m = (offsets >= 0) & (offsets + N_t <= len(buffer))
         offsets = offsets[valid_m]
         if offsets.size == 0:
             continue
@@ -243,7 +273,7 @@ def get_best_region(
 
         def evaluate_offset(sample_offset: int):
             k_off = sample_offset - s0
-            candidate_block = buf_slice[k_off : k_off + N].copy()
+            candidate_block = buf_slice[k_off : k_off + N_t].copy()
             evaluation_local = evaluate_candidate(candidate_block)
             evaluation_local["relative_offset"] = sample_offset - center_offset
             return evaluation_local
