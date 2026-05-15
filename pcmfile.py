@@ -47,20 +47,20 @@ class PCMFile(AudioFile):
               bytesPerSec, blockAlign, bitsPerSample) =  unpack(b"<LHHLLHH",tag)
         if formatTag != 1: raise IOError("Opened a non-PCM WAV file as a PCMFile")
         if bitsPerSample != 16: raise RuntimeError("PCMFile was not 16-bits per sample")
-        # skip any extra fmt chunk bytes beyond the 16 we already parsed
+        # skip any extra fmt chunk bytes (extended fmt chunks have formatSize > 16)
         if formatSize > 16:
             self.fp.read(formatSize - 16)
-        # find data chunk by walking WAV chunks properly
+        # walk RIFF chunks until we find "data"
         while True:
             chunk_id = self.fp.read(4)
             if len(chunk_id) < 4: raise RuntimeError("Didn't find WAV file 'data' chunk following 'fmt ' chunk")
             chunk_size_bytes = self.fp.read(4)
-            if len(chunk_size_bytes) < 4: raise RuntimeError("Didn't find WAV file 'data' chunk following 'fmt ' chunk")
+            if len(chunk_size_bytes) < 4: raise RuntimeError("Truncated chunk size in WAV file")
             if chunk_id == b"data": break
             chunk_size = unpack('<L', chunk_size_bytes)[0]
             self.fp.read(chunk_size)  # skip non-data chunk
 
-        # found data chunk; chunk_size_bytes already holds the data chunk size field
+        # found data chunk; chunk_size_bytes holds its size
         numSamples = unpack(b'<L', chunk_size_bytes)[0]
         assert bitsPerSample//BYTESIZE == bitsPerSample/BYTESIZE, "PCMFile bitsPerSample was not integer number of bytes"
         numSamples //= nChannels * (bitsPerSample//BYTESIZE)  #assumes bitsPerSample is integer number of bytes
