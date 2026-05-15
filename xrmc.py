@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.12"
+# requires-python = ">=3.12,<3.14"
 # dependencies = [
 # "llvmlite==0.45.0",
 # "matplotlib>=3.10.6",

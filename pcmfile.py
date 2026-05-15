@@ -47,30 +47,21 @@ class PCMFile(AudioFile):
               bytesPerSec, blockAlign, bitsPerSample) =  unpack(b"<LHHLLHH",tag)
         if formatTag != 1: raise IOError("Opened a non-PCM WAV file as a PCMFile")
         if bitsPerSample != 16: raise RuntimeError("PCMFile was not 16-bits per sample")
-        # find data chunk
-        to_read = 4
+        # skip any extra fmt chunk bytes beyond the 16 we already parsed
+        if formatSize > 16:
+            self.fp.read(formatSize - 16)
+        # find data chunk by walking WAV chunks properly
         while True:
-             # get up to 4 bytes to compare with "data"
-             new_bytes =self.fp.read(to_read)
-             if len(new_bytes) < to_read: raise RuntimeError("Didn't find WAV file 'data' chunk following 'fmt ' chunk")
-             if to_read == 4:
-                tag = new_bytes[0:4]
-             else:
-                tag = tag[(4-to_read):4] + new_bytes[0:to_read]
-             # if equal to "data", we're done
-             if tag[0:4] == b"data":  break
-             # else figure out how many new bytes to read to check again
-             if tag[3] == 100:   # Note:  "d" = 100  (ASCII code)
-                to_read = 3
-             elif tag[2] == 100:
-                to_read = 2
-             elif tag[1] == 100:
-                to_read = 1
-             else:
-                to_read = 4
+            chunk_id = self.fp.read(4)
+            if len(chunk_id) < 4: raise RuntimeError("Didn't find WAV file 'data' chunk following 'fmt ' chunk")
+            chunk_size_bytes = self.fp.read(4)
+            if len(chunk_size_bytes) < 4: raise RuntimeError("Didn't find WAV file 'data' chunk following 'fmt ' chunk")
+            if chunk_id == b"data": break
+            chunk_size = unpack('<L', chunk_size_bytes)[0]
+            self.fp.read(chunk_size)  # skip non-data chunk
 
-        # found data chunk, read its data (leaving file pointer at start of real data)
-        numSamples = unpack(b'<L',self.fp.read(4))[0]
+        # found data chunk; chunk_size_bytes already holds the data chunk size field
+        numSamples = unpack(b'<L', chunk_size_bytes)[0]
         assert bitsPerSample//BYTESIZE == bitsPerSample/BYTESIZE, "PCMFile bitsPerSample was not integer number of bytes"
         numSamples //= nChannels * (bitsPerSample//BYTESIZE)  #assumes bitsPerSample is integer number of bytes
         # create a CodingParams object and pass header data to it as attributes
