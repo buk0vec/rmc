@@ -213,6 +213,10 @@ if __name__ == "__main__":
         help="Tempo in BPM (encode only, default: 120)",
     )
 
+    parser.add_argument("--tdbs", action="store_true", help="Enable transient detection + block switching")
+    parser.add_argument("--pred", action="store_true", help="Enable rhythmic prediction")
+    parser.add_argument("--entropy", action="store_true", help="Enable entropy coding")
+
     args = parser.parse_args()
 
     features = RMCFeatures(
@@ -228,7 +232,7 @@ if __name__ == "__main__":
         outFile = args.compress[1] if len(args.compress) > 1 else None
         Encode(
             inFile,
-            RMCFeatures(),
+            features,
             codedFilename=outFile,
             kbps=args.bitrate,
             tempo=args.tempo,
@@ -237,4 +241,4 @@ if __name__ == "__main__":
     else:
         inFile = args.decompress[0]
         outFile = args.decompress[1] if len(args.decompress) > 1 else None
-        Decode(inFile, RMCFeatures(), outFilename=outFile, verbose=args.verbose)
+        Decode(inFile, features, outFilename=outFile, verbose=args.verbose)
