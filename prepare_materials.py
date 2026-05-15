@@ -9,6 +9,7 @@ from mdct import *
 from pacbfile import *
 from pacfile import *
 from rmcfile import RMCFile
+from xrmc import Encode as xrmc_Encode, Decode as xrmc_Decode
 
 def quantize_td_fp(inFilename, outFilename):
     inFile = PCMFile(inFilename)
@@ -261,41 +262,13 @@ def pacb(inFilename, outFilename, rate_kb=128):
         # print( "\nDone with Encode/Decode test\n")
         # print( elapsed ," seconds elapsed")
 
-def rmc(inFilename, outFilename, rate_kb=128):
+def rmc(inFilename, outFilename, rate_kb=128, tempo=124):
     codedFilename = f"coded/{Path(inFilename).stem}_rmc_{rate_kb}kbps.rmc"
-
-    for Direction in ("Encode", "Decode"):
-        if Direction == "Encode":
-            print("\n\tEncoding input PCM file...", end="")
-            inFile = PCMFile(inFilename)
-            outFile = RMCFile(codedFilename)
-        else:
-            print("\n\tDecoding coded RMC file...", end="")
-            inFile = RMCFile(codedFilename)
-            outFile = PCMFile(outFilename)
-
-        codingParams = inFile.OpenForReading()
-
-        if Direction == "Encode":
-            codingParams.nMDCTLines = 1024
-            codingParams.nScaleBits = 3
-            codingParams.nMantSizeBits = 5
-            codingParams.targetBitsPerSample = rate_kb * 1000 / codingParams.sampleRate
-            print(f"Target bits/sample: {codingParams.targetBitsPerSample:0.1f}")
-            codingParams.nSamplesPerBlock = codingParams.nMDCTLines
-        else:
-            codingParams.bitsPerSample = 16
-
-        outFile.OpenForWriting(codingParams)
-
-        while True:
-            data = inFile.ReadDataBlock(codingParams)
-            if not data: break
-            outFile.WriteDataBlock(data, codingParams)
-            print(".", end="")
-
-        inFile.Close(codingParams)
-        outFile.Close(codingParams)
+    print(f"\n\tEncoding input PCM file...Target bits/sample: {rate_kb * 1000 / 44100:.1f}")
+    xrmc_Encode(inFilename, codedFilename=codedFilename,
+                targetBitsPerSample=rate_kb * 1000 / 44100, tempo=tempo, verbose=True)
+    print(f"\n\tDecoding coded RMC file...")
+    xrmc_Decode(codedFilename, outFilename=outFilename, verbose=True)
 
 
 if __name__ == "__main__":

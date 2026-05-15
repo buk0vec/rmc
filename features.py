@@ -6,9 +6,25 @@ use the same settings; .rmc files are only valid under the features.py
 they were encoded with.
 """
 
-ENTROPY_CODING       = True   # range-coded mantissas; False = raw bit writes
-VARIABLE_BIT_RATE    = True   # adaptive entropy-inflation EMA; False = inflation fixed at 1.0
-BLOCK_SWITCHING      = True   # transient-driven SHORT blocks; False = all LONG
-MID_SIDE_CODING      = True   # M/S stereo; False = always L/R
-PREDICTION           = True   # rhythmic prediction search; False = no prediction
-SHORT_BLOCK_BITBOOST = True   # 2× bit budget for SHORT blocks; False = 1× (requires BLOCK_SWITCHING)
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class RMCFeatures:
+    # Use entropy coding to compress mantissas
+    ENTROPY_CODING: bool = False
+    # transient-driven SHORT blocks; False = all LONG
+    BLOCK_SWITCHING: bool = False
+    # rhythmic prediction search; False = no prediction
+    PREDICTION: bool = False
+    # nLines-aware break-even threshold for complex prediction.
+    # When True, uses per-band threshold derived from the break-even condition:
+    # savings(n_lines * reduction_dB/6) >= 7-bit per-band cost.
+    # => threshold(b) = 10^(-42/(20*nLines[b]))
+    PRED_NLINES_THRESH: bool = True
+    # Fallback flat RMS ratio used when PRED_NLINES_THRESH=False.
+    # 0.5 = require ≥6 dB improvement.
+    PRED_ENABLE_RATIO: float = 0.75
+    # Maximum SFB index (exclusive) eligible for prediction; None = all bands.
+    # Bands >= PRED_MAX_SFB are never predicted.
+    PRED_MAX_SFB: int | None = None
