@@ -6,9 +6,13 @@ readme = "README.md"
 requires-python = ">=3.12,<3.14"
 dependencies = [
     "llvmlite==0.45.0",
+    "madmom @ git+https://github.com/CPJKU/madmom.git",
     "matplotlib>=3.10.6",
     "numba>=0.61.2",
     "numpy>=2",
     "scipy>=1.16.3",
     "tqdm>=4.67.3",
 ]
+
+[tool.uv.extra-build-dependencies]
+madmom = ["Cython", "numpy"]

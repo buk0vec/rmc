@@ -2,6 +2,7 @@
 # requires-python = ">=3.12,<3.14"
 # dependencies = [
 # "llvmlite==0.45.0",
+# "madmom @ git+https://github.com/CPJKU/madmom.git",
 # "matplotlib>=3.10.6",
 # "numba>=0.61.2",
 # "numpy>=2",
@@ -25,6 +26,20 @@ from features import RMCFeatures
 from pcmfile import *  # to get access to WAV file handling
 from rmcfile import *  # to get access to RMC file handling
 from spe import detectTransientsSPESamples
+
+
+def detect_tempo(inFilename: str) -> int:
+    """Estimate the dominant tempo of an audio file using madmom's RNN beat tracker."""
+    from madmom.features.beats import RNNBeatProcessor
+    from madmom.features.tempo import CombFilterTempoHistogramProcessor, TempoEstimationProcessor
+
+    act_proc = RNNBeatProcessor()
+    hist_proc = CombFilterTempoHistogramProcessor(fps=100)
+    tempo_proc = TempoEstimationProcessor(fps=100, histogram_processor=hist_proc)
+
+    activations = act_proc(inFilename)
+    tempi = tempo_proc(activations)
+    return int(round(float(tempi[0][0])))
 
 
 def print_flavor():
@@ -58,11 +73,15 @@ def Encode(
     nMantSizeBits=5,
     kbps=128,
     targetBitsPerSample=None,
-    tempo: int = 120,
+    tempo: int | None = None,
     verbose: bool = False,
 ):
     if codedFilename is None:
         codedFilename = f"{Path(inFilename).stem}.rmc"
+
+    if tempo is None:
+        tempo = detect_tempo(inFilename)
+        print(f"Auto-detected tempo: {tempo} BPM")
 
     inFile = PCMFile(inFilename)
     outFile = RMCFile(codedFilename, features=features)
@@ -137,7 +156,7 @@ def Encode(
 
 def Decode(
     inFilename,
-    features: RMCFeatures,
+    features: RMCFeatures | None = None,
     outFilename=None,
     verbose: bool = False,
 ):
@@ -147,7 +166,7 @@ def Decode(
     if verbose:
         print(f"\nDecoding {inFilename} -> {outFilename}")
 
-    inFile = RMCFile(inFilename, features=features)
+    inFile = RMCFile(inFilename, features=features or RMCFeatures())
     outFile = PCMFile(outFilename)
 
     codingParams = inFile.OpenForReading()
@@ -209,8 +228,8 @@ if __name__ == "__main__":
         "-t",
         "--tempo",
         type=int,
-        default=120,
-        help="Tempo in BPM (encode only, default: 120)",
+        default=None,
+        help="Tempo in BPM (encode only, default: auto-detect via madmom)",
     )
 
     parser.add_argument("--tdbs", action="store_true", help="Enable transient detection + block switching")
@@ -241,4 +260,4 @@ if __name__ == "__main__":
     else:
         inFile = args.decompress[0]
         outFile = args.decompress[1] if len(args.decompress) > 1 else None
-        Decode(inFile, features, outFilename=outFile, verbose=args.verbose)
+        Decode(inFile, features=features, outFilename=outFile, verbose=args.verbose)
