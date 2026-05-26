@@ -63,7 +63,7 @@ class RMCFile(AudioFile):
         if AC2A_BLOCK_SWITCHING:
             _nMDCTLines_trans = (nMDCTLines + nMDCTLines // 16) // 2
             myParams.nMDCTLines_trans = _nMDCTLines_trans
-            myParams.sfBands_trans = TransitionSFBands(_nMDCTLines_trans, sampleRate)
+            myParams.sfBands_trans = DesignSFBands(_nMDCTLines_trans, sampleRate)
         myParams.prevBlockType = LONG
         myParams.blockType = LONG
         myParams.block_queue = []
@@ -391,7 +391,7 @@ class RMCFile(AudioFile):
         if AC2A_BLOCK_SWITCHING:
             _nMDCTLines_trans = (codingParams.nMDCTLines + codingParams.nMDCTLines_short) // 2
             codingParams.nMDCTLines_trans = _nMDCTLines_trans
-            codingParams.sfBands_trans = TransitionSFBands(_nMDCTLines_trans, codingParams.sampleRate)
+            codingParams.sfBands_trans = DesignSFBands(_nMDCTLines_trans, codingParams.sampleRate)
             codingParams.currentSamplePos = 0
             codingParams.short_blocks_remaining = 0
             # Pre-set nSamplesPerBlock for the first PCM read

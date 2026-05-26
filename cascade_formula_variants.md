@@ -1,16 +1,28 @@
 # Cascade Formula Variants
 
-Two designs for AC-2A block switching. Toggle between them by applying the diffs below.
+Three designs for AC-2A block switching.
 
 ---
 
-## Version A — Old formula, no gate (CURRENT)
+## Version A — Fixed cascade, imprecise placement
 Produces `Van_124_bs_adaptive_2.wav`. Transients mostly land in **STOP** (35/40 on Van_124).  
-k ∈ [0,7], b_start ∈ [128, 896]. MEDIUM only when k ≥ 1.
+`b_start = 896` always (k is always clamped to 7 on real material — the 3-bit field carries no useful information).  
+One MEDIUM of fixed size (1024 samples), same window shape every time.  
+Robust because it ignores detector precision; same structure regardless of where the transient is detected.
 
-## Version B — Second-block formula
-Guarantees transients land in **SHORT** (39/40 on Van_124, 1 edge case at start of file).  
-k ∈ [0,7], b_start ∈ [896, 1792]. MEDIUM always present.
+## Version B — Variable MEDIUM, precise placement (CURRENT)
+Guarantees transients land in **SHORT** (positions 128–255 in the 256-sample window, always the right/new-samples half).  
+`b_start = (7+k)*128`, range 896–1152 samples (K_ATTACK_MAX=2 caps k at 2). One MEDIUM block whose window shape changes with k (left overlap varies).  
+k ∈ [0, K_ATTACK_MAX]. MEDIUM always present.  
+SPE detector (80 events on Van_124 at 96 kbps) replaced the envelope-follower + local-min approach (40 events).
+
+## Version C — Fixed MEDIUM, count adapts (NOT YET IMPLEMENTED)
+Transients always land in **SHORT**.  
+MEDIUM is a fixed size (e.g. 512 samples, 256/128 overlaps) — same window shape every time.  
+k controls **how many MEDIUMs** appear on the lead/tail sides, not the window shape.  
+Chain: `START → MEDIUM → MEDIUM → ... → SHORT(s) → MEDIUM → ... → STOP`  
+Multiple SHORTs also possible — choice of MEDIUMs vs SHORTs is arithmetic: if transient is `d` samples in, use `floor(d / MEDIUM_SIZE)` MEDIUMs to get close, then SHORT for the last hop.  
+Advantage over B: every MEDIUM has identical frequency/time resolution, so psych model tables can be pre-computed and quantization noise is consistent across the cascade regardless of k.
 
 ---
 
@@ -96,76 +108,109 @@ new_prior.append(all_samples[-_keep:])
 
 ---
 
+## Why (7+k) is correct: OAA tracing
+
+A naive analysis of block type at `currentSamplePos` when the cascade fires gives wrong results because it ignores that `nSamplesPerBlock` for the START block is pre-set to `b_start` by the *previous* LONG block's end-of-block lookahead.
+
+### Cascade sequence (Version B, K_ATTACK_MAX=2)
+
+Let P1 = `currentSamplePos` after the last LONG block completes. Transient at absolute position T.
+
+```
+Block         nSamplesPerBlock  PCM consumed           MDCT window
+LONG (prev)   1024              [P1-1024, P1)          left=1024, right=1024
+START         b_start           [P1, P1+b_start)       left=1024, right=b_start
+MEDIUM        128               [P1+b_start, P1+b_start+128)  left=b_start, right=128
+SHORT         128               [P1+b_start+128, P1+b_start+256)  left=128, right=128
+STOP          1024              [P1+b_start+256, P1+b_start+1280) left=128, right=1024
+```
+
+The SHORT MDCT window (N=256) layout:
+- n=0..127 (left half):  PCM [P1+b_start, P1+b_start+128)  — MEDIUM's right IMDCT tail
+- n=128..255 (right half): PCM [P1+b_start+128, P1+b_start+256) — SHORT's own new samples
+
+Sine window weight: `w(n) = sin(π*(n+0.5)/256)`. Peaks at n≈128 (w≈1.0), near zero at n=0 and n=255.
+
+### k formula derivation
+
+From the end-of-LONG-block lookahead:
+```
+_raw_next  = T - P1
+k_encoded  = max(0, min(K_ATTACK_MAX, (_raw_next - 1024) // 128))
+b_start    = (7 + k_encoded) * 128
+```
+
+Transient position within the SHORT window:
+```
+pos_in_short = T - (P1 + b_start) = _raw_next - (7 + k) * 128
+```
+
+For the bucket boundary `_raw_next = 1024 + 128*k` (exact lower edge of k-range):
+```
+pos_in_short = 1024 + 128*k - (7+k)*128 = 1024 - 896 = 128   ← window center, w≈1.0
+```
+
+For the top of the bucket `_raw_next = 1024 + 128*k + 127`:
+```
+pos_in_short = 128 + 127 = 255   ← window end, w≈0.006
+```
+
+So `(7+k)*128` **always** places the transient in n=128..255 (the right/new-samples half), with position 128 (maximum sine weight) when the transient aligns exactly with the bucket boundary.
+
+### Why (8+k) is wrong
+
+With `b_start = (8+k)*128`:
+```
+pos_in_short = 1024 + 128*k - (8+k)*128 = 0   ← window start, w≈0.006
+```
+
+The transient lands at n=0, where the sine window is essentially zero. The onset is invisible to the quantizer — (8+k) is catastrophically wrong.
+
+### Why naive analysis gives "0/40 transients in SHORT"
+
+A script that traces `codingParams.blockType` at WriteDataBlock **entry** (before the state machine runs) reads the block type of the *previous* block, not the current one. The LONG block that becomes START has blockType=LONG at entry. Its state machine fires at lines ~498-510 and changes blockType to START before processing — so the print at entry shows "LONG" for what is actually the START block. Every block type appears shifted by one, making the Short block appear to contain nothing.
+
+---
+
 ## Key tradeoff
 
 | | Version A | Version B |
 |---|---|---|
-| Transient placement | Mostly STOP | Always SHORT (except first block) |
-| b_start range | 128–896 | 896–1792 |
+| Transient placement | Mostly STOP | Always in SHORT right half (n=128..255) |
+| b_start range | 128–896 (always 896) | 896–1152 (K_ATTACK_MAX=2) |
 | MEDIUM always present | No (k=0 → none) | Yes |
 | min_spacing | 2048 samples | 2176 samples |
-| Perceptual result | Sounds smoother on Van_124 | Transients more temporally precise |
+| Transient detector | Envelope follower + local-min | SPE (128-sample resolution) |
+| Events on Van_124 | 40 | 80 |
 
-Version A sounded better on Van_124 at 96 kbps as of 2026-04-26. Root cause of B's artifact not yet diagnosed — psych model and TDAC are both correct; likely something about large asymmetric MEDIUM windows.
+Version A sounded better on Van_124 at 96 kbps as of 2026-04-26 with the envelope-follower detector. SPE integration (2026-05-01) is more sensitive and finer-grained — Version B + SPE not yet A/B-tested against Version A.
 
 ---
 
-## Analysis: why Version A sounds better (2026-04-26)
+## Analysis: history of Version A vs B comparison (2026-04-26 → 2026-05-01)
 
 ### k is always 7 in Version A
 
 Version A formula: `k = max(0, min(7, d // 128 - 1))`
 
-All second-block transients have d ∈ [1024, 2047]. For d ≥ 1024: `d // 128 ≥ 8`, so `8 - 1 = 7`. k is always clamped to 7 — the 3-bit bitstream field carries no useful information on this material. `b_start = max(128, 7*128) = 896` every single time. The MEDIUM block is always exactly 1024 samples (b_start=896, SHORT=128, 896+128=1024). Version A's cascade is effectively a constant.
+All second-block transients have d ∈ [1024, 2047]. For d ≥ 1024: `d // 128 ≥ 8`, so `8 - 1 = 7`. k is always clamped to 7 — the 3-bit bitstream field carries no useful information on this material. `b_start = max(128, 7*128) = 896` every single time. Version A's cascade is effectively a constant: same window shape every block.
 
-### Version B MEDIUM blocks are much larger
+### Transient detector precision mattered for Version B
 
-With `b_start = (7 + k) * 128`:
-- k=0 → b_start=896, MEDIUM=1024 samples (same as Version A)
-- k=7 → b_start=1792, MEDIUM=1920 samples
+With the envelope-follower detector, `TD.py`'s gate opened ~10–50 samples after the true acoustic onset. If b_start was set for a late detection, the actual transient onset fell in the MEDIUM block. Version A was immune — it ignored the detected position.
 
-Large, variable MEDIUM windows likely cause the audible artifact. TDAC is verified correct at all boundaries; psych model adapts via DesignSFBands. Most likely culprit is the large asymmetric MEDIUM window shape itself — it covers almost two full LONG blocks of time, and the 576-line MDCT at this huge asymmetry may interact badly with quantization noise at low-to-medium bitrate.
+Local-minimum onset detection (2026-04-26) fixed this: walk backward from the envelope peak to the local minimum in the 200-sample pre-peak window. This moved positions 37–193 samples earlier, and Version B improved significantly.
 
-### Transient detector latency makes Version B fragile
+Gate-filter fix (2026-04-26): adaptive MAX_SHIFT walk-back introduced a phantom event by changing block assignment. Fix: spacing filter uses `gate_block` (pre-shift) rather than post-shift `sample_index`. Result: 40 clean events on Van_124, all in SHORT.
 
-`TD.py` uses a 0.5ms attack envelope follower (22 samples at 44100 Hz). `extractTransient` gates the signal then finds `hit[0]` — the first raw audio sample above 0.001 in the gated window. This introduces a systematic latency of roughly **10–50 samples** relative to the true acoustic onset (the actual first non-zero sample of the transient).
+### SPE replaces envelope follower (2026-05-01)
 
-Version B places SHORT at the *detected* position. If the detector is late by 30 samples and b_start was set for the detected position, the actual transient onset falls in the MEDIUM block, not SHORT. Version A is immune: it always uses the same fixed cascade (b_start=896) regardless of how accurate the detection is.
+SPE detects transients from energy ratios between sub-blocks (128-sample resolution, 4 layers). No gate latency, no walk-back needed. Reports `sample_index` directly at the 128-sample resolution of the finest firing layer. On Van_124 at 96 kbps: 80 events (vs 40 with local-min). K_ATTACK_MAX=2 caps b_start at 1152 samples.
 
-**Version B is precise about an imprecise measurement. Version A is robust because it ignores the measurement.**
-
-### What was needed for Version B to work well: local-minimum onset detection (SOLVED 2026-04-26)
-
-**Root cause confirmed**: the envelope-difference gate opens when `fast_env ≈ 10% of peak`, which coincides with the 10% relative walk-back threshold — both land at the same point. Fixed offset (-20 samples) also insufficient and made some events worse by overshooting. The real solution: walk backward from the local envelope peak to find the **local minimum** of the fast envelope in the 200-sample window before the peak. That valley is the bottom of the pre-attack dip — where the transient actually lifts off from background.
-
-**Implementation in `simple_run.py`** (in the event-range loop):
-```python
-# Find local peak of fast envelope, then find the local minimum
-# between the background and that peak.
-LOOKAHEAD = 100
-LOOKBACK = 200
-peak_start = max(0, detected - 50)
-peak_end = min(len(fast_env_mono), detected + LOOKAHEAD)
-peak_abs = peak_start + int(np.argmax(fast_env_mono[peak_start:peak_end]))
-min_start = max(0, peak_abs - LOOKBACK)
-min_rel = int(np.argmin(fast_env_mono[min_start:peak_abs]))
-sample_index = min_start + min_rel
-```
-
-`fast_env_mono = np.maximum(fast_envelope[0], fast_envelope[1])` must be computed before the loop.
-
-**Result**: positions move 37–193 samples earlier than gate opening, Version B sounds much better (confirmed on Van_124 at 96 kbps, 2026-04-26). 38/39 transients land in SHORT (1 edge case at start of file; also lost 1 close pair at 9.78s due to min_spacing filter).
-
-### Gate-filter fix for adaptive MAX_SHIFT (SOLVED 2026-04-26)
-
-Adaptive MAX_SHIFT (100 when gap>8192, else 50) improved sharpness vs fixed 50 but introduced a phantom event at 3.95s. Root cause: shifting an event's `sample_index` back by 100 samples changed its block assignment by 1, widening the gap to the next event just enough to let a previously-filtered event through the spacing filter.
-
-**Fix**: spacing filter (`enforceMinEventSpacing`) uses `gate_block = detected // blockSize` (pre-shift) rather than `sample_index // blockSize` (post-shift). This decouples the local-min walk-back from the filter decision — walk-back can freely move `sample_index` without changing which events survive. The `gate_block` field is stored on each event dict; `enforceMinEventSpacing` falls back to `block` when absent.
-
-**Result**: 40 events (vs 39 with fixed-shift filtering; the 9.78s close pair both survive since their gate positions are genuinely 4 blocks apart). No 4s artifact. Adaptive MAX_SHIFT gives full sharpness benefit.
+Version B + SPE vs Version A has not yet been A/B-tested perceptually. With K_ATTACK_MAX=2 (b_start ∈ [896, 1152]) the MEDIUM windows are small — the "large MEDIUM" concern from the k=7 era (b_start up to 1792) no longer applies.
 
 **Encodes for reference**:
-- `Van_124_bs_B_gatefilter_96k.wav` — Version B + local-min + adaptive MAX_SHIFT + gate-filter (current best)
-- `Van_124_bs_B_localmin.wav` — Version B + local-min detection, fixed MAX_SHIFT=100, shift-based filter
+- `Van_124_bs_B_adaptive.rmc` / `.wav` — Version B + SPE (K_ATTACK_MAX=2, 80 events, current)
+- `Van_124_bs_B_localmin.wav` — Version B + envelope local-min, 40 events
 - `Van_124_bs_B_compensated.wav` — Version B + fixed 20-sample offset (mixed results)
 - `Van_124_bs_adaptive_2.wav` — Version A (fixed cascade, transients mostly in STOP)
