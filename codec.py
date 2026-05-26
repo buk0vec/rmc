@@ -157,6 +157,7 @@ def Encode(data, codingParams):
             if codingParams.block_overhead is not None
             else 0
         )
+        codingParams._pool_draw = codingParams._pool_draws[iCh]
         (s, b, m, o) = EncodeSingleChannel(data[iCh], codingParams)
         scaleFactor.append(s)
         bitAlloc.append(b)
@@ -199,6 +200,7 @@ def EncodeSingleChannel(data, codingParams):
         SMRs = CalcSMRs(masking_samples, mdctLines_scaled, overallScale, codingParams.sampleRate, sfBands)
 
         bitBudget = int(codingParams.targetBitsPerSample * halfN)
+        bitBudget += codingParams._pool_draw
         bitBudget -= nScaleBits * (sfBands.nBands + 1)
         bitBudget -= codingParams.nMantSizeBits * sfBands.nBands
         bitBudget -= codingParams._block_overhead
@@ -247,6 +249,7 @@ def EncodeSingleChannel(data, codingParams):
         SMRs = CalcSMRs(masking_samples, mdctLines, overallScale, codingParams.sampleRate, sfBands)
 
         bitBudget = codingParams.targetBitsPerSample * halfN
+        bitBudget += codingParams._pool_draw
         bitBudget -= nScaleBits * (sfBands.nBands + 1)
         bitBudget -= codingParams.nMantSizeBits * sfBands.nBands
         bitBudget -= codingParams._block_overhead
@@ -298,6 +301,7 @@ def EncodeSingleChannel(data, codingParams):
         SMRs = CalcSMRs(masking_samples, mdctLines, overallScale, codingParams.sampleRate, sfBands)
 
         bitBudget = codingParams.targetBitsPerSample * halfN
+        bitBudget += codingParams._pool_draw
         bitBudget -= nScaleBits * (sfBands.nBands + 1)
         bitBudget -= codingParams.nMantSizeBits * sfBands.nBands
         bitBudget -= codingParams._block_overhead
@@ -326,6 +330,7 @@ def EncodeSingleChannel(data, codingParams):
     else:
         halfN = halfN_long
         bitBudget = codingParams.targetBitsPerSample * halfN
+        bitBudget += codingParams._pool_draw
         bitBudget -= nScaleBits * (sfBands_long.nBands + 1)
         bitBudget -= codingParams.nMantSizeBits * sfBands_long.nBands
         bitBudget -= codingParams._block_overhead

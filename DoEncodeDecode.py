@@ -14,7 +14,7 @@ def EncodeDecode(
     codedFilename="coded.pac",
     nMDCTLines=1024,
     nScaleBits=5,
-    nMantSizeBits=5,
+    nMantSizeBits=3,
     targetBitsPerSample=2.4,
     tempo: int = 120,
     verbose: bool = True,
@@ -73,11 +73,20 @@ if __name__ == "__main__":
     features_bs = RMCFeatures(BLOCK_SWITCHING=True)
     # Block switching and prediction
     features_bspred = RMCFeatures(PREDICTION=True, BLOCK_SWITCHING=True)
+    features_entropy = RMCFeatures(ENTROPY_CODING=True)
+    features_ecpred = RMCFeatures(ENTROPY_CODING=True, PREDICTION=True)
+    features_ecbs = RMCFeatures(ENTROPY_CODING=True, BLOCK_SWITCHING=True)
+    features_all = RMCFeatures(
+        PREDICTION=True, BLOCK_SWITCHING=True, ENTROPY_CODING=True
+    )
+    TARGET_KBPS = 80000
+    SAMPLE_RATE = 44100
+    target_bps = TARGET_KBPS / SAMPLE_RATE
     EncodeDecode(
         inFilename="ringnoord.wav",
         codedFilename="rn.rmc",
         outFilename="rn_base.wav",
-        targetBitsPerSample=80000 / 44100,
+        targetBitsPerSample=target_bps,
         tempo=164,
         features=features,
     )
@@ -85,7 +94,7 @@ if __name__ == "__main__":
         inFilename="ringnoord.wav",
         codedFilename="rn_pred.rmc",
         outFilename="rn_pred.wav",
-        targetBitsPerSample=80000 / 44100,
+        targetBitsPerSample=target_bps,
         tempo=164,
         features=features_pred,
     )
@@ -93,7 +102,7 @@ if __name__ == "__main__":
         inFilename="ringnoord.wav",
         codedFilename="rn_bs.rmc",
         outFilename="rn_bs.wav",
-        targetBitsPerSample=80000 / 44100,
+        targetBitsPerSample=target_bps,
         tempo=164,
         features=features_bs,
     )
@@ -101,7 +110,39 @@ if __name__ == "__main__":
         inFilename="ringnoord.wav",
         codedFilename="rn_bspred.rmc",
         outFilename="rn_bspred.wav",
-        targetBitsPerSample=80000 / 44100,
+        targetBitsPerSample=target_bps,
         tempo=164,
         features=features_bspred,
+    )
+    EncodeDecode(
+        inFilename="ringnoord.wav",
+        codedFilename="rn_entropy.rmc",
+        outFilename="rn_entropy.wav",
+        targetBitsPerSample=target_bps,
+        tempo=164,
+        features=features_entropy,
+    )
+    EncodeDecode(
+        inFilename="ringnoord.wav",
+        codedFilename="rn_ecpred.rmc",
+        outFilename="rn_ecpred.wav",
+        targetBitsPerSample=target_bps,
+        tempo=164,
+        features=features_ecpred,
+    )
+    EncodeDecode(
+        inFilename="ringnoord.wav",
+        codedFilename="rn_ecbs.rmc",
+        outFilename="rn_ecbs.wav",
+        targetBitsPerSample=target_bps,
+        tempo=164,
+        features=features_ecbs,
+    )
+    EncodeDecode(
+        inFilename="ringnoord.wav",
+        codedFilename="rn_all.rmc",
+        outFilename="rn_all.wav",
+        targetBitsPerSample=target_bps,
+        tempo=164,
+        features=features_all,
     )
