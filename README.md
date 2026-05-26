@@ -24,12 +24,12 @@
 > Does not support numpy < 2, please make sure you have numpy 2.0 or higher installed!!!
 
 > [!IMPORTANT]
-> **ffmpeg** is required for automatic tempo detection. Install it before running:
+> **ffmpeg** is required for automatic tempo detection (unless you are only using 16-bit 44.1 kHz WAV). Install it before running:
 > - macOS: `brew install ffmpeg`
 > - Ubuntu/Debian: `sudo apt install ffmpeg`
 > - Windows: download from https://ffmpeg.org/download.html
 >
-> If you provide tempo manually with `-t`, ffmpeg is not needed.
+> If you provide tempo manually with `-t`, or if all your audio files are 16-bit 44.1 kHz WAV, ffmpeg is not needed.
 
 ## xrmc 
 
@@ -77,4 +77,3 @@ pip install -r requirements.txt
 ```
 
 Then, run as normal with `python3 __.py`
-
