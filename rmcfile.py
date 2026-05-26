@@ -159,21 +159,37 @@ class RMCFile(AudioFile):
 
         raw_decoded = []
         for iCh in range(codingParams.nChannels):
-            s = self.fp.read(calcsize("<L"))
-            if not s:
+            # Read packed header: 1 byte always, then 1 more for SHORT or 3 more for others.
+            #   SHORT : 2 bytes = [3b type | 13b nBytes] (big-endian)
+            #   others: 4 bytes = [3b type | 29b nBytes] (big-endian)
+            hdr1 = self.fp.read(1)
+            if not hdr1:
                 if codingParams.overlapAndAdd:
                     overlapAndAdd = codingParams.overlapAndAdd
                     codingParams.overlapAndAdd = 0
                     return overlapAndAdd
                 else:
                     return
-            nBytes = unpack("<L", s)[0]
+            b0 = hdr1[0]
+            block_type_hdr = (b0 >> 5) & 0x7
+            if block_type_hdr == SHORT:
+                b1 = self.fp.read(1)
+                if not b1:
+                    raise RuntimeError("Truncated SHORT frame header")
+                full = (b0 << 8) | b1[0]
+                nBytes = full & 0x1FFF  # low 13 bits
+            else:
+                rest = self.fp.read(3)
+                if len(rest) < 3:
+                    raise RuntimeError("Truncated frame header")
+                full = (b0 << 24) | (rest[0] << 16) | (rest[1] << 8) | rest[2]
+                nBytes = full & 0x1FFFFFFF  # low 29 bits
             pb = PackedBits()
             pb.SetPackedData(self.fp.read(nBytes))
             if pb.nBytes < nBytes:
                 raise RuntimeError("Only read a partial block of coded PACFile data")
 
-            codingParams.blockType = pb.ReadBits(3)
+            codingParams.blockType = block_type_hdr  # from packed header, not pb
             if codingParams.blockType == START:
                 k_attack_read = pb.ReadBits(4)
                 codingParams.k_attack_for_stop = k_attack_read
@@ -511,6 +527,9 @@ class RMCFile(AudioFile):
             np.zeros(buf_size) for _ in range(codingParams.nChannels)
         ]
         codingParams.buffer_fill = 0  # samples of real audio accumulated so far
+        # Coding pool (bit reservoir): per-channel accumulated surplus
+        codingParams.bit_pool = [0] * codingParams.nChannels
+        codingParams._pool_draws = [0] * codingParams.nChannels
 
         self.fp.write(pack("<L", sfBands.nBands))
         self.fp.write(pack("<" + str(sfBands.nBands) + "H", *(sfBands.nLines.tolist())))
@@ -877,10 +896,16 @@ class RMCFile(AudioFile):
                         codingParams._stat_band_1_20_sum += float(np.mean(ef[:max_idx]))
                         codingParams._stat_band_1_20_count += 1
 
-        # Compute per-channel bitstream overhead not accounted for in base bit budget
+        # Compute per-channel bitstream overhead not accounted for in base bit budget.
+        # Frame header format: packed type+nBytes field (block_type NOT written inside pb).
+        #   SHORT : 2 bytes = [3b type | 13b nBytes]  (max 8191 bytes; pool draws can push SHORT large)
+        #   others: 4 bytes = [3b type | 29b nBytes]
         block_overhead = []
         for iCh in range(codingParams.nChannels):
-            oh = 32 + 3 + 3  # nBytes field + 3b block type + 3b pred type
+            if current_block_type == SHORT:
+                oh = 16 + 3  # 2-byte packed header + 3b pred type (type not in pb)
+            else:
+                oh = 32 + 3  # 4-byte packed header + 3b pred type (type not in pb)
             if current_block_type == START:
                 oh += 4  # k_attack field
             if ranges[iCh] is not None:
@@ -896,6 +921,17 @@ class RMCFile(AudioFile):
         codingParams.masking_signals = maskingData_
         codingParams.mdct_pred_corrections = corrections
         codingParams.block_overhead = block_overhead
+        # Pool: effective halfN for this block type and per-channel draw snapshot
+        if current_block_type == SHORT:
+            _pool_eff_halfN = codingParams.nMDCTLines_short
+        elif current_block_type in (START, STOP, MEDIUM):
+            _pool_eff_halfN = (codingParams.cascade_a + codingParams.cascade_b) // 2
+        else:
+            _pool_eff_halfN = halfN
+        # All block types draw from the pool
+        codingParams._pool_draws = [
+            codingParams.bit_pool[iCh] for iCh in range(codingParams.nChannels)
+        ]
         (scaleFactor, bitAlloc, mantissa, overallScaleFactor) = self.Encode(
             residuals, codingParams
         )
@@ -1122,12 +1158,30 @@ class RMCFile(AudioFile):
                     nBits += codingParams.nMantSizeBits + codingParams.nScaleBits
                 nBits += entropy_pb.nBits
 
+            # Pool update: recycle coding surplus into next frame's budget.
+            # actual_ch accounts for packed header size (block_type lives in header, not pb).
+            nominal_ch = int(codingParams.targetBitsPerSample * _pool_eff_halfN)
+            if codingParams.blockType == SHORT:
+                actual_ch = nBits + 16  # 2-byte packed [3b type | 13b nBytes]
+            else:
+                actual_ch = nBits + 32  # 4-byte packed [3b type | 29b nBytes]
+            codingParams.bit_pool[iCh] = max(
+                0, codingParams.bit_pool[iCh] + nominal_ch - actual_ch
+            )
             nBytes = (nBits + BYTESIZE - 1) // BYTESIZE
-            self.fp.write(pack("<L", int(nBytes)))
+            if codingParams.blockType == SHORT:
+                # 2-byte header: [3b block_type | 13b nBytes] big-endian
+                assert nBytes <= 8191, (
+                    f"SHORT block nBytes={nBytes} exceeds 13-bit limit"
+                )
+                self.fp.write(pack(">H", (codingParams.blockType << 13) | nBytes))
+            else:
+                # 4-byte header: [3b block_type | 29b nBytes] big-endian
+                self.fp.write(pack(">L", (codingParams.blockType << 29) | nBytes))
 
             pb = PackedBits()
             pb.Size(nBytes)
-            pb.WriteBits(codingParams.blockType, 3)
+            # block_type is in the packed header — NOT written into pb
             if codingParams.blockType == START:
                 pb.WriteBits(codingParams.k_attack_for_stop, 4)
             pb.WriteBits(PRED_MAP[ranges[iCh]], 3)

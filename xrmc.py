@@ -55,7 +55,7 @@ def Encode(
     codedFilename=None,
     nMDCTLines=1024,
     nScaleBits=5,
-    nMantSizeBits=5,
+    nMantSizeBits=3,
     kbps=128,
     targetBitsPerSample=None,
     tempo: int = 120,
@@ -84,7 +84,9 @@ def Encode(
         print(f"\nEncoding {inFilename} -> {codedFilename} at {kbps} kb/s")
 
     if features.BLOCK_SWITCHING:
-        events = detectTransientsSPESamples(inFilename, nMDCTLines=nMDCTLines, verbose=verbose)
+        events = detectTransientsSPESamples(
+            inFilename, nMDCTLines=nMDCTLines, verbose=verbose
+        )
         # Exact sample positions — no grid alignment or shift heuristics needed.
         # Enforce minimum 2048-sample spacing so cascades can never collide.
         # min cascade = (15+0)*halfN_short + halfN_short + halfN_short + halfN
@@ -99,7 +101,9 @@ def Encode(
                 last_pos = si
         transient_map = {}
         if verbose:
-            print(f"TransientDetection: {len(transient_positions)} events (exact positions)")
+            print(
+                f"TransientDetection: {len(transient_positions)} events (exact positions)"
+            )
     else:
         transient_map = {}
         transient_positions = []
