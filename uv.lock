@@ -166,7 +166,7 @@ wheels = [
 [[package]]
 name = "madmom"
 version = "0.17.dev0"
-source = { git = "https://github.com/CPJKU/madmom.git#27f032e8947204902c675e5e341a3faf5dc86dae" }
+source = { git = "https://github.com/CPJKU/madmom.git?rev=27f032e8947204902c675e5e341a3faf5dc86dae#27f032e8947204902c675e5e341a3faf5dc86dae" }
 dependencies = [
     { name = "mido" },
     { name = "numpy" },
@@ -379,7 +379,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "llvmlite", specifier = "==0.45.0" },
-    { name = "madmom", git = "https://github.com/CPJKU/madmom.git" },
+    { name = "madmom", git = "https://github.com/CPJKU/madmom.git?rev=27f032e8947204902c675e5e341a3faf5dc86dae" },
     { name = "matplotlib", specifier = ">=3.10.6" },
     { name = "numba", specifier = ">=0.61.2" },
     { name = "numpy", specifier = ">=2" },

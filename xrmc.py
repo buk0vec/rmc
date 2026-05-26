@@ -2,7 +2,7 @@
 # requires-python = ">=3.12,<3.14"
 # dependencies = [
 # "llvmlite==0.45.0",
-# "madmom @ git+https://github.com/CPJKU/madmom.git",
+# "madmom @ git+https://github.com/CPJKU/madmom.git@27f032e8947204902c675e5e341a3faf5dc86dae",
 # "matplotlib>=3.10.6",
 # "numba>=0.61.2",
 # "numpy>=2",
@@ -39,6 +39,9 @@ def detect_tempo(inFilename: str) -> int:
 
     activations = act_proc(inFilename)
     tempi = tempo_proc(activations)
+    if len(tempi) == 0:
+        print("Auto-tempo detection returned no result — defaulting to 120 BPM")
+        return 120
     return int(round(float(tempi[0][0])))
 
 
