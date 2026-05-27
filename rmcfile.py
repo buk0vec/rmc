@@ -100,10 +100,9 @@ class RMCFile(AudioFile):
         myParams.sfBands_short = ShortBlockSFBands(
             myParams.nMDCTLines_short, sampleRate
         )
-        if AC2A_BLOCK_SWITCHING:
-            _nMDCTLines_trans = (nMDCTLines + nMDCTLines // 16) // 2
-            myParams.nMDCTLines_trans = _nMDCTLines_trans
-            myParams.sfBands_trans = DesignSFBands(_nMDCTLines_trans, sampleRate)
+        _nMDCTLines_trans = (nMDCTLines + nMDCTLines // 16) // 2
+        myParams.nMDCTLines_trans = _nMDCTLines_trans
+        myParams.sfBands_trans = DesignSFBands(_nMDCTLines_trans, sampleRate)
         myParams.prevBlockType = LONG
         myParams.blockType = LONG
         myParams.block_queue = []
@@ -463,31 +462,30 @@ class RMCFile(AudioFile):
         codingParams.sfBands_short = ShortBlockSFBands(
             codingParams.nMDCTLines_short, codingParams.sampleRate
         )
-        if AC2A_BLOCK_SWITCHING:
-            _nMDCTLines_trans = (
-                codingParams.nMDCTLines + codingParams.nMDCTLines_short
-            ) // 2
-            codingParams.nMDCTLines_trans = _nMDCTLines_trans
-            codingParams.sfBands_trans = DesignSFBands(
-                _nMDCTLines_trans, codingParams.sampleRate
-            )
-            codingParams.currentSamplePos = 0
-            codingParams.short_blocks_remaining = 0
-            # Pre-set nSamplesPerBlock for the first PCM read
-            _positions0 = getattr(codingParams, "transientPositions", [])
-            if _positions0:
-                _raw0 = _positions0[0]
-                if _raw0 < 2 * codingParams.nMDCTLines:
-                    _k0 = max(
-                        0,
-                        min(
-                            K_ATTACK_MAX,
-                            (_raw0 - codingParams.nMDCTLines)
-                            // codingParams.nMDCTLines_short,
-                        ),
-                    )
-                    _bs0 = (15 + _k0) * codingParams.nMDCTLines_short
-                    codingParams.nSamplesPerBlock = _bs0
+        _nMDCTLines_trans = (
+            codingParams.nMDCTLines + codingParams.nMDCTLines_short
+        ) // 2
+        codingParams.nMDCTLines_trans = _nMDCTLines_trans
+        codingParams.sfBands_trans = DesignSFBands(
+            _nMDCTLines_trans, codingParams.sampleRate
+        )
+        codingParams.currentSamplePos = 0
+        codingParams.short_blocks_remaining = 0
+        # Pre-set nSamplesPerBlock for the first PCM read
+        _positions0 = getattr(codingParams, "transientPositions", [])
+        if _positions0:
+            _raw0 = _positions0[0]
+            if _raw0 < 2 * codingParams.nMDCTLines:
+                _k0 = max(
+                    0,
+                    min(
+                        K_ATTACK_MAX,
+                        (_raw0 - codingParams.nMDCTLines)
+                        // codingParams.nMDCTLines_short,
+                    ),
+                )
+                _bs0 = (15 + _k0) * codingParams.nMDCTLines_short
+                codingParams.nSamplesPerBlock = _bs0
         codingParams.blockType = LONG
         codingParams.block_queue = []
         codingParams.cascade_a = codingParams.nMDCTLines
