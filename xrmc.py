@@ -22,10 +22,11 @@ from pathlib import Path
 
 import numpy as np
 
+from blockswitching import K_ATTACK_MAX, LONG, STOP
 from features import RMCFeatures
 from pcmfile import *  # to get access to WAV file handling
 from rmcfile import *  # to get access to RMC file handling
-from spe import detectTransientsSPESamples
+from spe import TransientDetector
 
 
 def detect_tempo(inFilename: str) -> int:
@@ -112,40 +113,22 @@ def Encode(
         print(f"\nEncoding {inFilename} -> {codedFilename} at {kbps} kb/s")
 
     if features.BLOCK_SWITCHING:
-        events = detectTransientsSPESamples(
-            inFilename, nMDCTLines=nMDCTLines, verbose=verbose
-        )
-        # Exact sample positions — no grid alignment or shift heuristics needed.
-        # Enforce minimum 2048-sample spacing so cascades can never collide.
-        # min cascade = (15+0)*halfN_short + halfN_short + halfN_short + halfN
-        #             = 17*halfN_short + halfN  (halfN_short = nMDCTLines//16)
-        min_spacing = 17 * (nMDCTLines // 16) + nMDCTLines  # 2112 samples
-        transient_positions = []
-        last_pos = -min_spacing
-        for e in events:
-            si = int(e["sample_index"])
-            if si - last_pos >= min_spacing and si >= nMDCTLines:
-                transient_positions.append(si)
-                last_pos = si
-        transient_map = {}
+        detector = TransientDetector(inFilename, nMDCTLines, codingParams.sampleRate)
         if verbose:
-            print(
-                f"TransientDetection: {len(transient_positions)} events (exact positions)"
-            )
+            print("Block switching enabled (streaming transient detection)")
     else:
-        transient_map = {}
-        transient_positions = []
+        detector = None
         if verbose:
             print("Block switching disabled, using all LONG blocks")
 
-    codingParams.transientBlocks = transient_map
-    codingParams.transientPositions = transient_positions
-    codingParams.blockIndex = 0
     codingParams.targetBitsPerSample = targetBitsPerSample
 
     # open the output file
     outFile.OpenForWriting(codingParams)  # (includes writing header)
-    # Read the input file and pass its data to the output file to be written
+
+    halfN = codingParams.nMDCTLines
+    halfN_short = codingParams.nMDCTLines_short
+
     total_samples = codingParams.numSamples
     processed_samples = 0
 
@@ -153,15 +136,38 @@ def Encode(
 
     pbar = tqdm(total=total_samples, unit="samp", desc="Encoding", disable=not verbose)
 
+    pos = 0
+    prev = LONG
+
     while True:
+        if prev in (LONG, STOP):
+            hit = detector.poll(pos) if detector else None
+            if hit is not None:
+                k = max(0, min(K_ATTACK_MAX, (hit - pos - halfN) // halfN_short))
+                codingParams.nSamplesPerBlock = (15 + k) * halfN_short
+                codingParams.next_k_attack = k
+            else:
+                codingParams.nSamplesPerBlock = halfN
+                codingParams.next_k_attack = -1
+        elif codingParams.block_queue:
+            codingParams.nSamplesPerBlock = codingParams.block_queue[0]["b"]
+        else:
+            codingParams.nSamplesPerBlock = halfN_short
+
         data = inFile.ReadDataBlock(codingParams)
         if not data:
             break
         outFile.WriteDataBlock(data, codingParams)
+        pos = codingParams.currentSamplePos
+        prev = codingParams.blockType
         n = len(data[0])
         processed_samples += n
         pbar.update(n)
+
     pbar.close()
+
+    if detector:
+        detector.close()
 
     inFile.Close(codingParams)
     outFile.Close(codingParams)

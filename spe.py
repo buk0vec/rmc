@@ -42,6 +42,8 @@ import numpy as np
 import scipy.io.wavfile
 import scipy.signal
 
+from pcmfile import PCMFile
+
 # Per-layer thresholds T[j].  A transient fires when: curr_peak * T[j] > prev_peak
 THRESHOLDS = (0.40, 0.40, 0.07, 0.07, 0.05)
 
@@ -320,3 +322,117 @@ def detectTransientsSPESamples(audioPath: str,
     if verbose:
         print(f"  SPE events ({len(events)}): {[e['sample_index'] for e in events]}")
     return events
+
+
+class TransientDetector:
+    """
+    Streaming SPE transient detector with its own PCM read pointer.
+
+    Maintains filter state and reads ahead of the encoder by one block.
+    Call poll(encoder_pos) once per free-running LONG/STOP block to get the
+    absolute sample position of the next transient, or None if none found.
+    """
+
+    def __init__(self, inFilename, nMDCTLines, sampleRate):
+        self._halfN = nMDCTLines
+        self._read_pos = 0
+
+        self._filters = [_design_highpass(sampleRate, cf)
+                         for cf in (HPF_CUTOFF, HPF_CUTOFF2, HPF_CUTOFF3)
+                         if cf is not None]
+
+        self._pcm = PCMFile(inFilename)
+        self._cp = self._pcm.OpenForReading()
+        self._cp.nSamplesPerBlock = nMDCTLines
+
+        first_chunk = self._read_chunk()
+        if first_chunk is not None:
+            self._filter_states = [scipy.signal.sosfilt_zi(f) * first_chunk[0]
+                                   for f in self._filters]
+            self._prev_filtered = [np.zeros(nMDCTLines) for _ in self._filters]
+            self._advance_filters(first_chunk)
+        else:
+            self._filter_states = [scipy.signal.sosfilt_zi(f) for f in self._filters]
+            self._prev_filtered = [np.zeros(nMDCTLines) for _ in self._filters]
+
+    def _read_chunk(self):
+        data = self._pcm.ReadDataBlock(self._cp)
+        if not data:
+            return None
+        chunk = data[0] if len(data) == 1 else np.mean(data, axis=0)
+        return chunk.astype(np.float64)
+
+    def _read_n(self, n):
+        """Read exactly n samples, mono-mixed. Returns None at EOF."""
+        self._cp.nSamplesPerBlock = n
+        data = self._pcm.ReadDataBlock(self._cp)
+        self._cp.nSamplesPerBlock = self._halfN
+        if not data:
+            return None
+        chunk = data[0] if len(data) == 1 else np.mean(data, axis=0)
+        return chunk.astype(np.float64)
+
+    def _advance_filters(self, chunk):
+        for i, (filt, state) in enumerate(zip(self._filters, self._filter_states)):
+            curr, new_state = scipy.signal.sosfilt(filt, chunk, zi=state)
+            self._filter_states[i] = new_state
+            self._prev_filtered[i] = curr
+        self._read_pos += self._halfN
+
+    def poll(self, encoder_pos):
+        """
+        Call once per free-running LONG/STOP block.
+
+        Checks territory [encoder_pos+halfN, encoder_pos+2*halfN) for a transient.
+        Uses variable-size catch-up to handle non-halfN-aligned encoder positions
+        that occur after cascades (whose total size is not a multiple of halfN).
+        Returns absolute hit sample position, or None.
+        """
+        halfN = self._halfN
+
+        # If behind encoder_pos, catch up with one variable-size read (filter state only,
+        # no _prev_filtered update — the prev half will be read explicitly next).
+        if self._read_pos < encoder_pos:
+            gap = encoder_pos - self._read_pos
+            chunk = self._read_n(gap)
+            if chunk is None:
+                return None
+            for i, (filt, state) in enumerate(zip(self._filters, self._filter_states)):
+                _, new_state = scipy.signal.sosfilt(filt, chunk, zi=state)
+                self._filter_states[i] = new_state
+            self._read_pos = encoder_pos
+
+        # If now exactly at encoder_pos (fresh arrival after catch-up, or start of file),
+        # read [encoder_pos, encoder_pos+halfN) explicitly as the prev half.
+        if self._read_pos == encoder_pos:
+            prev_chunk = self._read_n(halfN)
+            if prev_chunk is None:
+                return None
+            for i, (filt, state) in enumerate(zip(self._filters, self._filter_states)):
+                curr, new_state = scipy.signal.sosfilt(filt, prev_chunk, zi=state)
+                self._filter_states[i] = new_state
+                self._prev_filtered[i] = curr
+            self._read_pos = encoder_pos + halfN
+
+        # read_pos == encoder_pos + halfN; _prev_filtered covers [encoder_pos, encoder_pos+halfN).
+        # Read curr half [encoder_pos+halfN, encoder_pos+2*halfN) and run SPE.
+        curr_chunk = self._read_n(halfN)
+        if curr_chunk is None:
+            return None
+
+        earliest = None
+        N = 2 * halfN
+        for i, (filt, state) in enumerate(zip(self._filters, self._filter_states)):
+            curr, new_state = scipy.signal.sosfilt(filt, curr_chunk, zi=state)
+            buf = np.concatenate([self._prev_filtered[i], curr])
+            fired, offset = spe_block(buf, N, THRESHOLDS, ZERO_THRESHOLD)
+            if fired:
+                earliest = offset if earliest is None else min(earliest, offset)
+            self._filter_states[i] = new_state
+            self._prev_filtered[i] = curr
+        self._read_pos += halfN
+
+        return (encoder_pos + halfN + earliest) if earliest is not None else None
+
+    def close(self):
+        self._pcm.Close(self._cp)
