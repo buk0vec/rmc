@@ -7,21 +7,35 @@ Implements the SPE method from:
 
 Algorithm summary (Section 3.4 + Layer 5 extension):
   - Buffer: N samples (left N/2 = previous block, right N/2 = current block)
-  - High-pass filter at 2 kHz (lowered from paper's 8 kHz for broader coverage)
+  - Tri-band high-pass filter (see HPF_CUTOFF / HPF_CUTOFF2 / HPF_CUTOFF3)
   - Five layers of sub-block sizes: N/2, N/4, N/8, N/16, N/32
   - For each layer j, compare peak of each right-half sub-block to the
     immediately preceding sub-block (cascading within the right half).
   - Flag condition: curr_peak * T[j] > prev_peak  AND  curr_peak > zero_threshold
-  - A transient is declared if ANY layer fires.
+  - A transient is declared if ANY layer of ANY band fires.
 
 Threshold selection (empirically validated on castanets, glockenspiel, harpsichord):
   - L1 (N/2  = 1024 samples): T=0.40  → ratio must exceed 2.5×
   - L2 (N/4  =  512 samples): T=0.40  → ratio must exceed 2.5×
   - L3 (N/8  =  256 samples): T=0.07  → ratio must exceed 14.3×
   - L4 (N/16 =  128 samples): T=0.07  → ratio must exceed 14.3×
-  - L5 (N/32 =   64 samples): T=0.07  → ratio must exceed 14.3×
+  - L5 (N/32 =   64 samples): T=0.05  → ratio must exceed 20×
   Layer 1 dominates for these signals (all transients visible at coarse scale).
   Layers 2-5 add coverage for brief, localised spikes that Layer 1 misses.
+
+Tri-band HPF design:
+  Band 1 (HPF_CUTOFF  = 2500 Hz): primary — percussive/plucked instruments
+    (castanets, harpsichord). Filters sustain that would elevate prev_peak.
+  Band 2 (HPF_CUTOFF2 = 1500 Hz): secondary — bowed/sustained instruments
+    (violin) whose harmonic energy lies mostly below 2 kHz.
+  Band 3 (HPF_CUTOFF3 = 5000 Hz): tertiary — metallic resonators (glockenspiel).
+    Attack energy above 5 kHz decays much faster than lower harmonics, so
+    the attack/decay ratio is clean here even within ringing clusters.
+    Without this band, glockenspiel notes inside a decay tail are masked
+    because prev_peak stays elevated in the lower bands.
+
+Validated detection counts (tri-band SPE, EBU-SQAM):
+  castanets=86  glockenspiel=44  harpsichord=10  Van_124=91
 """
 
 import numpy as np
@@ -29,20 +43,13 @@ import scipy.io.wavfile
 import scipy.signal
 
 # Per-layer thresholds T[j].  A transient fires when: curr_peak * T[j] > prev_peak
-# L1 (N/2  = 1024 samples): ratio > 2.5×   — coarse, catches large block-level jumps
-# L2 (N/4  =  512 samples): ratio > 2.5×   — catches attacks mid-block
-# L3 (N/8  =  256 samples): ratio > 14.3×  — catches sub-block spikes (one SHORT-block)
-# L4 (N/16 =  128 samples): ratio > 14.3×  — 128-sample resolution
-# L5 (N/32 =   64 samples): ratio > 14.3×  — finest resolution, matches SHORT half-window
-# Validated empirically on castanets / glockenspiel / harpsichord (EBU-SQAM).
-THRESHOLDS = (0.4, 0.4, 0.07, 0.07, 0.05)
+THRESHOLDS = (0.40, 0.40, 0.07, 0.07, 0.05)
 
-# Paper uses 1500/32768 ≈ 0.046 at 8 kHz HPF cutoff. Lowering cutoff to 2 kHz
-# passes more attack energy from low-frequency instruments (harpsichord, plucked
-# strings); zero_threshold of 750/32768 avoids noise false-positives at that cutoff.
-# Validated on castanets (88), glockenspiel (29), harpsichord (10).
 ZERO_THRESHOLD = 750.0 / 32768.0    # ≈ 0.0229
-HPF_CUTOFF = 800.0                  # Hz; lowered from 2kHz to catch bass-heavy gradual transients
+
+HPF_CUTOFF  = 2500.0   # Hz — primary band
+HPF_CUTOFF2 = 1500.0   # Hz — secondary band (violin / bowed instruments)
+HPF_CUTOFF3 = 5000.0   # Hz — tertiary band (glockenspiel / metallic resonators)
 
 
 def _design_highpass(sr: int, cutoff: float = HPF_CUTOFF, order: int = 4):
@@ -73,7 +80,6 @@ def _refine_offset(hp_buf: np.ndarray, start: int, sub: int, target: int = 64,
         e_hi = _sub_peak(hp_buf, start + sub, sub)
         if e_hi > e_lo:
             start += sub
-    # Back up one target-sized slot if the preceding slot has significant onset energy
     if start - target >= half:
         e_prev = _sub_peak(hp_buf, start - target, target)
         e_curr = _sub_peak(hp_buf, start, target)
@@ -92,10 +98,9 @@ def spe_block(hp_buf: np.ndarray,
     Layout: buf[0 : N//2] = previous half-block
             buf[N//2 : N] = current half-block
 
-    Runs L1–L5 coarse-to-fine via threshold comparison. Each firing layer
-    overwrites best_offset. After the loop, if the finest firing layer is
-    coarser than 64 samples, _refine_offset bisects that sub-block down to
-    64-sample resolution using peak energy.
+    Runs L1–L5 coarse-to-fine. Each firing layer overwrites best_offset.
+    After the loop, if the finest firing layer is coarser than 64 samples,
+    _refine_offset bisects it down to 64-sample resolution.
 
     Returns
     -------
@@ -106,11 +111,11 @@ def spe_block(hp_buf: np.ndarray,
     half = N >> 1
     fired = False
     best_offset = 0
-    best_sub = 64  # sub-block size at the finest layer that fired
+    best_sub = 64
 
     for j in range(1, 6):
-        sub = N >> j            # sub-block size: N/2, N/4, N/8, N/16, N/32
-        n_curr = 1 << (j - 1)  # sub-blocks in current half: 1, 2, 4, 8, 16
+        sub = N >> j
+        n_curr = 1 << (j - 1)
         T = thresholds[j - 1]
         prev_peak = _sub_peak(hp_buf, half - sub, sub)
         for k in range(n_curr):
@@ -170,128 +175,148 @@ def spe_block_details(hp_buf: np.ndarray,
     return flagged, ratios, layer_flags
 
 
+def _run_spe_pass(audio: np.ndarray, sr: int, cutoff: float,
+                  nMDCTLines: int, thresholds: tuple,
+                  zero_threshold: float) -> dict:
+    """
+    Run one full HPF pass over the audio.
+    Returns {block_idx: sample_offset} for every block where SPE fires.
+    sample_offset is at 64-sample resolution within the current half-block.
+    """
+    sos = _design_highpass(sr, cutoff)
+    zi = scipy.signal.sosfilt_zi(sos) * audio[0]
+
+    N = nMDCTLines * 2
+    half = nMDCTLines
+    n_blocks = int(np.ceil(len(audio) / half))
+    prev_hp = np.zeros(half, dtype=np.float64)
+    detected = {}
+
+    for block_idx in range(n_blocks):
+        start = block_idx * half
+        end = min(start + half, len(audio))
+        chunk = audio[start:end]
+        if len(chunk) < half:
+            chunk = np.pad(chunk, (0, half - len(chunk)))
+
+        curr_hp, zi = scipy.signal.sosfilt(sos, chunk, zi=zi)
+        buf = np.concatenate([prev_hp, curr_hp])
+
+        fired, offset = spe_block(buf, N, thresholds, zero_threshold)
+        if fired:
+            detected[block_idx] = offset
+
+        prev_hp = curr_hp
+
+    return detected
+
+
 def detectTransientsSPE(audioPath: str,
                         nMDCTLines: int = 1024,
                         cutoff: float = HPF_CUTOFF,
+                        cutoff2: float = HPF_CUTOFF2,
+                        cutoff3: float = HPF_CUTOFF3,
                         thresholds: tuple = THRESHOLDS,
                         zero_threshold: float = ZERO_THRESHOLD,
                         verbose: bool = False) -> np.ndarray:
     """
-    Detect transients using SPE. Returns sorted block indices.
-
-    Each codec block advances `nMDCTLines` samples; the SPE buffer is
-    2*nMDCTLines samples (previous half + current half).
+    Detect transients using tri-band SPE. Returns sorted block indices.
+    Union of all three band detections, with adjacent-block dedup.
     """
     sr, raw = scipy.io.wavfile.read(audioPath)
-
     if raw.dtype == np.int16:
         audio = raw.astype(np.float64) / 32768.0
     elif raw.dtype == np.int32:
         audio = raw.astype(np.float64) / 2147483648.0
     else:
         audio = raw.astype(np.float64)
-
     if audio.ndim == 2:
         audio = audio.mean(axis=1)
 
-    sos = _design_highpass(sr, cutoff)
-    zi = scipy.signal.sosfilt_zi(sos) * audio[0]
+    detected = set()
+    for cf in (cutoff, cutoff2, cutoff3):
+        if cf is not None:
+            detected |= set(_run_spe_pass(audio, sr, cf, nMDCTLines,
+                                          thresholds, zero_threshold))
+    combined = sorted(detected)
 
-    N = nMDCTLines * 2
-    half = nMDCTLines
-
-    n_samples = len(audio)
-    n_blocks = int(np.ceil(n_samples / half))
-
-    prev_hp = np.zeros(half, dtype=np.float64)
+    # Adjacent-block dedup: straddled-boundary artifacts fire on consecutive
+    # blocks for the same attack. Drop the later of any (N, N+1) pair.
     transient_blocks = []
-
-    for block_idx in range(n_blocks):
-        start = block_idx * half
-        end = min(start + half, n_samples)
-        chunk = audio[start:end]
-        if len(chunk) < half:
-            chunk = np.pad(chunk, (0, half - len(chunk)))
-
-        curr_hp, zi = scipy.signal.sosfilt(sos, chunk, zi=zi)
-
-        buf = np.concatenate([prev_hp, curr_hp])
-        fired, _ = spe_block(buf, N, thresholds, zero_threshold)
-        if fired:
-            transient_blocks.append(block_idx)
-
-        prev_hp = curr_hp
+    skip_next = False
+    for i, b in enumerate(combined):
+        if skip_next:
+            skip_next = False
+            continue
+        transient_blocks.append(b)
+        if i + 1 < len(combined) and combined[i + 1] == b + 1:
+            skip_next = True
 
     if verbose:
         print(f"  SPE blocks ({len(transient_blocks)}): {transient_blocks}")
-
     return np.array(transient_blocks, dtype=int)
 
 
 def detectTransientsSPESamples(audioPath: str,
                                 nMDCTLines: int = 1024,
                                 cutoff: float = HPF_CUTOFF,
+                                cutoff2: float = HPF_CUTOFF2,
+                                cutoff3: float = HPF_CUTOFF3,
                                 thresholds: tuple = THRESHOLDS,
                                 zero_threshold: float = ZERO_THRESHOLD,
                                 verbose: bool = False) -> list:
     """
-    Detect transients using SPE. Returns event dicts with sample positions.
+    Detect transients using tri-band SPE. Returns event dicts with exact sample positions.
 
-    Uses the finest-resolution firing sub-block (L5 = 64-sample resolution)
-    to compute an exact-ish sample position within each detected block.
-    This matches the event dict format expected by xrmc.py's AC2A path.
+    Runs three independent HPF passes and unions their detections.
+    For blocks detected by multiple bands, uses the earliest (minimum) offset
+    so the transient marker lands as close to the true onset as possible.
+    Adjacent-block duplicates from boundary-straddling are suppressed.
 
     Returns
     -------
     list of {"sample_index": int, "block": int}
-        sample_index : absolute sample position of the onset
-        block        : block index (sample_index // nMDCTLines)
     """
     sr, raw = scipy.io.wavfile.read(audioPath)
-
     if raw.dtype == np.int16:
         audio = raw.astype(np.float64) / 32768.0
     elif raw.dtype == np.int32:
         audio = raw.astype(np.float64) / 2147483648.0
     else:
         audio = raw.astype(np.float64)
-
     if audio.ndim == 2:
         audio = audio.mean(axis=1)
 
-    sos = _design_highpass(sr, cutoff)
-    zi = scipy.signal.sosfilt_zi(sos) * audio[0]
-
-    N = nMDCTLines * 2
     half = nMDCTLines
 
-    n_samples = len(audio)
-    n_blocks = int(np.ceil(n_samples / half))
+    # Run all enabled bands; union block detections, keep earliest offset per block
+    block_offsets = {}
+    for cf in (cutoff, cutoff2, cutoff3):
+        if cf is None:
+            continue
+        for block_idx, offset in _run_spe_pass(audio, sr, cf, nMDCTLines,
+                                               thresholds, zero_threshold).items():
+            if block_idx not in block_offsets:
+                block_offsets[block_idx] = offset
+            else:
+                block_offsets[block_idx] = min(block_offsets[block_idx], offset)
 
-    prev_hp = np.zeros(half, dtype=np.float64)
-    events = []
+    combined = sorted(block_offsets)
 
-    for block_idx in range(n_blocks):
-        start = block_idx * half
-        end = min(start + half, n_samples)
-        chunk = audio[start:end]
-        if len(chunk) < half:
-            chunk = np.pad(chunk, (0, half - len(chunk)))
+    # Adjacent-block dedup (same logic as detectTransientsSPE)
+    deduped = []
+    skip_next = False
+    for i, b in enumerate(combined):
+        if skip_next:
+            skip_next = False
+            continue
+        deduped.append(b)
+        if i + 1 < len(combined) and combined[i + 1] == b + 1:
+            skip_next = True
 
-        curr_hp, zi = scipy.signal.sosfilt(sos, chunk, zi=zi)
-
-        buf = np.concatenate([prev_hp, curr_hp])
-        fired, sample_offset = spe_block(buf, N, thresholds, zero_threshold)
-        if fired:
-            sample_index = block_idx * half + sample_offset
-            events.append({
-                "sample_index": sample_index,
-                "block": block_idx,
-            })
-
-        prev_hp = curr_hp
+    events = [{"sample_index": b * half + block_offsets[b], "block": b}
+              for b in deduped]
 
     if verbose:
         print(f"  SPE events ({len(events)}): {[e['sample_index'] for e in events]}")
-
     return events

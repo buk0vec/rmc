@@ -100,9 +100,9 @@ class RMCFile(AudioFile):
         myParams.sfBands_short = ShortBlockSFBands(
             myParams.nMDCTLines_short, sampleRate
         )
-        _nMDCTLines_trans = (nMDCTLines + myParams.nMDCTLines_short) // 2
+        _nMDCTLines_trans = (nMDCTLines + nMDCTLines // 16) // 2
         myParams.nMDCTLines_trans = _nMDCTLines_trans
-        myParams.sfBands_trans = TransitionSFBands(_nMDCTLines_trans, sampleRate)
+        myParams.sfBands_trans = DesignSFBands(_nMDCTLines_trans, sampleRate)
         myParams.prevBlockType = LONG
         myParams.blockType = LONG
         myParams.block_queue = []
@@ -466,7 +466,7 @@ class RMCFile(AudioFile):
             codingParams.nMDCTLines + codingParams.nMDCTLines_short
         ) // 2
         codingParams.nMDCTLines_trans = _nMDCTLines_trans
-        codingParams.sfBands_trans = TransitionSFBands(
+        codingParams.sfBands_trans = DesignSFBands(
             _nMDCTLines_trans, codingParams.sampleRate
         )
         codingParams.currentSamplePos = 0
