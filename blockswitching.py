@@ -15,7 +15,6 @@ Music 422 -- RMC Project
 import numpy as np
 from psychoac import ScaleFactorBands, AssignMDCTLinesFromFreqLimits
 from window import KBDWindow
-from features import AC2A_BLOCK_SWITCHING, ADAPTIVE_CASCADE
 
 # ---------------------------------------------------------------------------
 # Block type constants
@@ -29,6 +28,9 @@ MEDIUM = 4   # Cascade intermediate: rising-sine(a) | falling-sine(b)
 
 # Number of short blocks that replace one long block
 N_SHORT_BLOCKS = 8
+
+# Maximum k_attack value (0..15); limits max MEDIUM window size in the AC-2A cascade
+K_ATTACK_MAX = 15
 
 
 # ---------------------------------------------------------------------------
@@ -155,11 +157,8 @@ def ShortWindowFunc(N_short):
     Returns:
         numpy array of shape (N_short,)
     """
-    w = np.zeros(N_short)
-    for n in range(N_short):
-        w[n] = np.sin(np.pi * (n + 0.5) / N_short)
-
-    return w
+    n = np.arange(N_short)
+    return np.sin(np.pi * (n + 0.5) / N_short)
 
 
 def StartWindowFunc(N_long, N_short):
@@ -196,8 +195,8 @@ def StartWindowFunc(N_long, N_short):
     w[N_long//2 : N_long//2 + pad] = 1.0
 
     # taper down with right half of short sine window
-    for n in range(N_short//2):
-        w[N_long//2 + pad + n] = np.sin(np.pi * (0.5 + n + N_short//2) / N_short)
+    n = np.arange(N_short//2)
+    w[N_long//2 + pad : N_long//2 + pad + N_short//2] = np.sin(np.pi * (0.5 + n + N_short//2) / N_short)
 
     return w
 
@@ -229,8 +228,8 @@ def StopWindowFunc(N_long, N_short):
     pad = (N_long//4 - N_short//4)
 
     # rise with left half of short sine window
-    for n in range(N_short//2):
-        w[pad + n] = np.sin(np.pi * (0.5 + n) / N_short)
+    n = np.arange(N_short//2)
+    w[pad : pad + N_short//2] = np.sin(np.pi * (0.5 + n) / N_short)
 
     # flat top
     w[N_short//2 + pad : N_long//2] = 1.0
@@ -389,6 +388,9 @@ def TransitionSFBands(nMDCTLines_trans, sampleRate):
     return ScaleFactorBands(nLines)
 
 
+_window_cache = {}
+
+
 def WindowForBlockType(block_type, N_long, N_short, k_attack=None,
                        cascade_a=None, cascade_b=None):
     """
@@ -409,25 +411,34 @@ def WindowForBlockType(block_type, N_long, N_short, k_attack=None,
         numpy array of length (cascade_a + cascade_b) for MEDIUM/cascade START/STOP,
         N_long for standard LONG/START/STOP, or N_short for SHORT.
     """
+    key = (block_type, N_long, N_short, cascade_a, cascade_b)
+    if key in _window_cache:
+        return _window_cache[key]
+
     if block_type == LONG:
-        return LongWindowFunc(N_long)
+        result = LongWindowFunc(N_long)
     elif block_type == SHORT:
-        return ShortWindowFunc(N_short)
+        result = ShortWindowFunc(N_short)
     elif block_type == MEDIUM:
         a = cascade_a if cascade_a is not None else N_long // 4
         b = cascade_b if cascade_b is not None else N_short // 2
-        return MediumTransWindowFunc(a, b)
+        result = MediumTransWindowFunc(a, b)
     elif block_type == START:
-        if AC2A_BLOCK_SWITCHING:
-            b = cascade_b if cascade_b is not None else N_short // 2
-            if b != N_short // 2:
-                return AC2AStartWindowFuncVar(N_long, b * 2)
-            return AC2AStartWindowFunc(N_long, N_short)
-        return StartWindowFunc(N_long, N_short)
+        if cascade_b is not None:  # AC2A path — caller supplies cascade dims
+            if cascade_b != N_short // 2:
+                result = AC2AStartWindowFuncVar(N_long, cascade_b * 2)
+            else:
+                result = AC2AStartWindowFunc(N_long, N_short)
+        else:
+            result = StartWindowFunc(N_long, N_short)  # Edler path
     elif block_type == STOP:
-        if AC2A_BLOCK_SWITCHING:
-            return AC2AStopWindowFunc(N_long, N_short)
-        return StopWindowFunc(N_long, N_short)
+        if cascade_a is not None:  # AC2A path — caller supplies cascade dims
+            result = AC2AStopWindowFunc(N_long, N_short)
+        else:
+            result = StopWindowFunc(N_long, N_short)  # Edler path
+
+    _window_cache[key] = result
+    return result
 
 
 # ---------------------------------------------------------------------------

@@ -6,13 +6,25 @@ use the same settings; .rmc files are only valid under the features.py
 they were encoded with.
 """
 
-ENTROPY_CODING       = False  # range-coded mantissas; False = raw bit writes
-VARIABLE_BIT_RATE    = False  # adaptive entropy-inflation EMA; False = inflation fixed at 1.0
-BLOCK_SWITCHING      = True   # transient-driven SHORT blocks; False = all LONG
-MID_SIDE_CODING      = False  # M/S stereo; False = always L/R
-PREDICTION           = False  # rhythmic prediction search; False = no prediction
-SHORT_BLOCK_BITBOOST = False  # 2× bit budget for SHORT blocks; False = 1× (requires BLOCK_SWITCHING)
-SUBBASS_HYBRID       = False  # sub-bass stays in LONG window during transients; change True/False to toggle (requires BLOCK_SWITCHING)
-AC2A_BLOCK_SWITCHING = True   # position-adaptive START/STOP windows that align with detected transient; False = fixed Edler windows (requires BLOCK_SWITCHING)
-ADAPTIVE_CASCADE     = True   # telescoping pre-attack cascade: START*(b=256/512) + MEDIUM(s) replace pre-attack SHORTs; False = fixed 7-SHORT events (requires AC2A_BLOCK_SWITCHING)
-K_ATTACK_MAX         = 15    # cap on k_attack (0..15); limits max MEDIUM window size (requires ADAPTIVE_CASCADE)
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class RMCFeatures:
+    # Use entropy coding to compress mantissas
+    ENTROPY_CODING: bool = False
+    # transient-driven SHORT blocks; False = all LONG
+    BLOCK_SWITCHING: bool = False
+    # rhythmic prediction search; False = no prediction
+    PREDICTION: bool = False
+    # nLines-aware break-even threshold for complex prediction.
+    # When True, uses per-band threshold derived from the break-even condition:
+    # savings(n_lines * reduction_dB/6) >= 7-bit per-band cost.
+    # => threshold(b) = 10^(-42/(20*nLines[b]))
+    PRED_NLINES_THRESH: bool = True
+    # Fallback flat RMS ratio used when PRED_NLINES_THRESH=False.
+    # 0.5 = require ≥6 dB improvement.
+    PRED_ENABLE_RATIO: float = 0.75
+    # Maximum SFB index (exclusive) eligible for prediction; None = all bands.
+    # Bands >= PRED_MAX_SFB are never predicted.
+    PRED_MAX_SFB: int | None = None
