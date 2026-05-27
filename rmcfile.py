@@ -51,6 +51,7 @@ from search import (
 )
 
 MAX16BITS = 32767
+
 PRED_MAP_REV = {v: k for k, v in PRED_MAP.items()}  # int → string for decoder
 
 
@@ -113,11 +114,14 @@ class RMCFile(AudioFile):
         myParams.sfBands = sfBands
 
         # RMC extras
-        myParams.numSamplesQuarterNote = int((60.0 / tempo) * sampleRate)
-        myParams.numSamplesHalfBar = int(((60.0 / tempo) * sampleRate) * 2)
-        myParams.numSamplesBar = int(((60.0 / tempo) * sampleRate) * 4)
-        myParams.numSamples2Bar = int(((60.0 / tempo) * sampleRate) * 8)
-        myParams.numSamples4Bar = int(((60.0 / tempo) * sampleRate) * 16)
+        _qn = (60.0 / tempo) * sampleRate
+        myParams.numSamplesEighthNote = int(_qn * 0.5)
+        myParams.numSamples3Bar = int(_qn * 12)
+        myParams.numSamplesQuarterNote = int(_qn)
+        myParams.numSamplesHalfBar = int(_qn * 2)
+        myParams.numSamplesBar = int(_qn * 4)
+        myParams.numSamples2Bar = int(_qn * 8)
+        myParams.numSamples4Bar = int(_qn * 16)
         myParams.search_range = 1023
         # Buffer sized to hold the furthest lookback (4 bars) plus one block and search margin.
         buf_size = myParams.numSamples4Bar + nMDCTLines + myParams.search_range
@@ -502,21 +506,14 @@ class RMCFile(AudioFile):
         )
 
         # RMC extras
-        codingParams.numSamplesQuarterNote = int(
-            (60.0 / codingParams.tempo) * codingParams.sampleRate
-        )
-        codingParams.numSamplesHalfBar = int(
-            ((60.0 / codingParams.tempo) * codingParams.sampleRate) * 2
-        )
-        codingParams.numSamplesBar = int(
-            ((60.0 / codingParams.tempo) * codingParams.sampleRate) * 4
-        )
-        codingParams.numSamples2Bar = int(
-            ((60.0 / codingParams.tempo) * codingParams.sampleRate) * 8
-        )
-        codingParams.numSamples4Bar = int(
-            ((60.0 / codingParams.tempo) * codingParams.sampleRate) * 16
-        )
+        _qn = (60.0 / codingParams.tempo) * codingParams.sampleRate
+        codingParams.numSamplesEighthNote = int(_qn * 0.5)
+        codingParams.numSamples3Bar = int(_qn * 12)
+        codingParams.numSamplesQuarterNote = int(_qn)
+        codingParams.numSamplesHalfBar = int(_qn * 2)
+        codingParams.numSamplesBar = int(_qn * 4)
+        codingParams.numSamples2Bar = int(_qn * 8)
+        codingParams.numSamples4Bar = int(_qn * 16)
         codingParams.search_range = 1023
         buf_size = (
             codingParams.numSamples4Bar

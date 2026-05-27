@@ -42,7 +42,13 @@ def detect_tempo(inFilename: str) -> int:
     if len(tempi) == 0:
         print("Auto-tempo detection returned no result — defaulting to 120 BPM")
         return 120
-    return int(round(float(tempi[0][0])))
+    raw_tempo = float(tempi[0][0])
+    # Octave-fold into [50, 200] range
+    while raw_tempo < 50.0:
+        raw_tempo *= 2.0
+    while raw_tempo > 200.0:
+        raw_tempo /= 2.0
+    return int(round(raw_tempo))
 
 
 def print_flavor():
@@ -159,6 +165,7 @@ def Encode(
 
     inFile.Close(codingParams)
     outFile.Close(codingParams)
+    return codingParams
 
 
 def Decode(
