@@ -52,7 +52,7 @@ uv run python xrmc.py -c song.wav -b 128 -v
 ### Decode
 
 ```bash
-uv run python xrmc.py -d song.rmc -v
+uv run python xrmc.py -d song.rmc (--tdbs --pred --entropy) -v
 ```
 
 ### Python API
