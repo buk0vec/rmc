@@ -38,7 +38,7 @@
 ### Encode
 
 ```bash
-uv run python xrmc.py -c song.wav -b 128 -v
+uv run python xrmc.py -c song.wav (song.rmc) -b 128 (--tdbs --pred --entropy) -v
 ```
 
 - `-c` compress (input.wav [output.rmc])
@@ -52,7 +52,7 @@ uv run python xrmc.py -c song.wav -b 128 -v
 ### Decode
 
 ```bash
-uv run python xrmc.py -d song.rmc (--tdbs --pred --entropy) -v
+uv run python xrmc.py -d song.rmc (song.wav) (--tdbs --pred --entropy) -v
 ```
 
 ### Python API
