@@ -431,6 +431,8 @@ class RMCFile(AudioFile):
         """
         # write a header tag
         self.fp.write(self.tag)
+        # Store original sample count so the decoder can trim output to match the source.
+        original_numSamples = codingParams.numSamples
         # make sure that the number of samples in the file is a multiple of the
         # number of MDCT half-blocksize, otherwise zero pad as needed
         if codingParams.numSamples % codingParams.nMDCTLines:
@@ -440,13 +442,14 @@ class RMCFile(AudioFile):
             )  # zero padding for partial final PCM block
         # also add in the delay block for the second pass w/ the last half-block
         codingParams.numSamples += codingParams.nMDCTLines  # due to the delay in processing the first samples on both sides of the MDCT block
-        # write the coded file attributes
+        # write the coded file attributes; use original_numSamples so the decoder
+        # knows the true output length and can trim the zero-padded tail.
         self.fp.write(
             pack(
                 "<LHLLHH",
                 codingParams.sampleRate,
                 codingParams.nChannels,
-                codingParams.numSamples,
+                original_numSamples,
                 codingParams.nMDCTLines,
                 codingParams.nScaleBits,
                 codingParams.nMantSizeBits,
