@@ -8,8 +8,6 @@ See RMC.md for full technical reference.
 Based on pacfile.py © 2009-2026 Marina Bosi & Richard E. Goldberg
 """
 
-import bisect
-
 import numpy as np  # to allow conversion of data blocks to numpy's array object
 
 import codec  # module where the actual PAC coding functions reside(this module only specifies the PAC file format)
@@ -51,6 +49,7 @@ from search import (
 )
 
 MAX16BITS = 32767
+
 PRED_MAP_REV = {v: k for k, v in PRED_MAP.items()}  # int → string for decoder
 
 
@@ -113,11 +112,14 @@ class RMCFile(AudioFile):
         myParams.sfBands = sfBands
 
         # RMC extras
-        myParams.numSamplesQuarterNote = int((60.0 / tempo) * sampleRate)
-        myParams.numSamplesHalfBar = int(((60.0 / tempo) * sampleRate) * 2)
-        myParams.numSamplesBar = int(((60.0 / tempo) * sampleRate) * 4)
-        myParams.numSamples2Bar = int(((60.0 / tempo) * sampleRate) * 8)
-        myParams.numSamples4Bar = int(((60.0 / tempo) * sampleRate) * 16)
+        _qn = (60.0 / tempo) * sampleRate
+        myParams.numSamplesEighthNote = int(_qn * 0.5)
+        myParams.numSamples3Bar = int(_qn * 12)
+        myParams.numSamplesQuarterNote = int(_qn)
+        myParams.numSamplesHalfBar = int(_qn * 2)
+        myParams.numSamplesBar = int(_qn * 4)
+        myParams.numSamples2Bar = int(_qn * 8)
+        myParams.numSamples4Bar = int(_qn * 16)
         myParams.search_range = 1023
         # Buffer sized to hold the furthest lookback (4 bars) plus one block and search margin.
         buf_size = myParams.numSamples4Bar + nMDCTLines + myParams.search_range
@@ -429,6 +431,8 @@ class RMCFile(AudioFile):
         """
         # write a header tag
         self.fp.write(self.tag)
+        # Store original sample count so the decoder can trim output to match the source.
+        original_numSamples = codingParams.numSamples
         # make sure that the number of samples in the file is a multiple of the
         # number of MDCT half-blocksize, otherwise zero pad as needed
         if codingParams.numSamples % codingParams.nMDCTLines:
@@ -438,13 +442,14 @@ class RMCFile(AudioFile):
             )  # zero padding for partial final PCM block
         # also add in the delay block for the second pass w/ the last half-block
         codingParams.numSamples += codingParams.nMDCTLines  # due to the delay in processing the first samples on both sides of the MDCT block
-        # write the coded file attributes
+        # write the coded file attributes; use original_numSamples so the decoder
+        # knows the true output length and can trim the zero-padded tail.
         self.fp.write(
             pack(
                 "<LHLLHH",
                 codingParams.sampleRate,
                 codingParams.nChannels,
-                codingParams.numSamples,
+                original_numSamples,
                 codingParams.nMDCTLines,
                 codingParams.nScaleBits,
                 codingParams.nMantSizeBits,
@@ -471,21 +476,6 @@ class RMCFile(AudioFile):
         )
         codingParams.currentSamplePos = 0
         codingParams.short_blocks_remaining = 0
-        # Pre-set nSamplesPerBlock for the first PCM read
-        _positions0 = getattr(codingParams, "transientPositions", [])
-        if _positions0:
-            _raw0 = _positions0[0]
-            if _raw0 < 2 * codingParams.nMDCTLines:
-                _k0 = max(
-                    0,
-                    min(
-                        K_ATTACK_MAX,
-                        (_raw0 - codingParams.nMDCTLines)
-                        // codingParams.nMDCTLines_short,
-                    ),
-                )
-                _bs0 = (15 + _k0) * codingParams.nMDCTLines_short
-                codingParams.nSamplesPerBlock = _bs0
         codingParams.blockType = LONG
         codingParams.block_queue = []
         codingParams.cascade_a = codingParams.nMDCTLines
@@ -502,21 +492,14 @@ class RMCFile(AudioFile):
         )
 
         # RMC extras
-        codingParams.numSamplesQuarterNote = int(
-            (60.0 / codingParams.tempo) * codingParams.sampleRate
-        )
-        codingParams.numSamplesHalfBar = int(
-            ((60.0 / codingParams.tempo) * codingParams.sampleRate) * 2
-        )
-        codingParams.numSamplesBar = int(
-            ((60.0 / codingParams.tempo) * codingParams.sampleRate) * 4
-        )
-        codingParams.numSamples2Bar = int(
-            ((60.0 / codingParams.tempo) * codingParams.sampleRate) * 8
-        )
-        codingParams.numSamples4Bar = int(
-            ((60.0 / codingParams.tempo) * codingParams.sampleRate) * 16
-        )
+        _qn = (60.0 / codingParams.tempo) * codingParams.sampleRate
+        codingParams.numSamplesEighthNote = int(_qn * 0.5)
+        codingParams.numSamples3Bar = int(_qn * 12)
+        codingParams.numSamplesQuarterNote = int(_qn)
+        codingParams.numSamplesHalfBar = int(_qn * 2)
+        codingParams.numSamplesBar = int(_qn * 4)
+        codingParams.numSamples2Bar = int(_qn * 8)
+        codingParams.numSamples4Bar = int(_qn * 16)
         codingParams.search_range = 1023
         buf_size = (
             codingParams.numSamples4Bar
@@ -542,6 +525,7 @@ class RMCFile(AudioFile):
         # initialize prevBlockType
         codingParams.prevBlockType = LONG
         codingParams.k_attack_for_stop = 0
+        codingParams.next_k_attack = -1
         # prediction stats
         codingParams._stat_total_blocks = 0
         codingParams._stat_pred_blocks = 0
@@ -591,18 +575,7 @@ class RMCFile(AudioFile):
         N_trans = halfN + halfN_short  # 1152 for AC-2A transitions
 
         # AC-2A: determine block type and cascade dimensions before building analysis windows
-        # Find the next transient within 2 * halfN samples using exact positions
-        _positions = getattr(codingParams, "transientPositions", [])
-        _pos = codingParams.currentSamplePos
-        _tidx = bisect.bisect_left(_positions, _pos)
-        if _tidx < len(_positions) and _positions[_tidx] < _pos + 2 * halfN:
-            _raw_offset = _positions[_tidx] - _pos
-            _k_encoded = max(0, min(K_ATTACK_MAX, (_raw_offset - halfN) // halfN_short))
-            _b_start = (15 + _k_encoded) * halfN_short
-            k_attack = _k_encoded
-        else:
-            _b_start = halfN_short
-            k_attack = -1
+        k_attack = getattr(codingParams, 'next_k_attack', -1)
 
         _prev = codingParams.prevBlockType
         _rem = codingParams.short_blocks_remaining
@@ -616,13 +589,13 @@ class RMCFile(AudioFile):
         elif _prev in (LONG, STOP):
             if k_attack >= 0:
                 _bt = START
-                medium_lead = plan_cascade(_k_encoded, halfN_short)
+                medium_lead = plan_cascade(k_attack, halfN_short)
                 codingParams.cascade_a = halfN
-                codingParams.cascade_b = _b_start
+                codingParams.cascade_b = (15 + k_attack) * halfN_short
                 for ma, mb in medium_lead:
                     codingParams.block_queue.append({"type": MEDIUM, "a": ma, "b": mb})
                 codingParams.short_blocks_remaining = 1
-                codingParams.k_attack_for_stop = _k_encoded
+                codingParams.k_attack_for_stop = k_attack
             else:
                 _bt = LONG
                 codingParams.cascade_a = halfN
@@ -1228,40 +1201,7 @@ class RMCFile(AudioFile):
                 pb.WriteBits(entropy_pb.buffer, entropy_pb.nBits)
             self.fp.write(pb.GetPackedData())
 
-        # AC-2A: advance sample counter and pre-set nSamplesPerBlock for the next PCM read
         codingParams.currentSamplePos += len(data[0])
-        _prev_now = codingParams.prevBlockType
-
-        # Look ahead from new position for the next transient
-        _pos_next = codingParams.currentSamplePos
-        _positions = getattr(codingParams, "transientPositions", [])
-        _tidx_next = bisect.bisect_left(_positions, _pos_next)
-        if (
-            _tidx_next < len(_positions)
-            and _positions[_tidx_next] < _pos_next + 2 * halfN
-        ):
-            _raw_next = _positions[_tidx_next] - _pos_next
-            _k_next = max(0, min(K_ATTACK_MAX, (_raw_next - halfN) // halfN_short))
-            _b_next = (15 + _k_next) * halfN_short
-            _k_next_valid = True
-        else:
-            _b_next = halfN
-            _k_next_valid = False
-
-        if codingParams.block_queue:
-            # Next block is queued (MEDIUM or STOP) — its nSPB = b of that block
-            codingParams.nSamplesPerBlock = codingParams.block_queue[0]["b"]
-        elif _prev_now in (LONG, STOP):
-            codingParams.nSamplesPerBlock = _b_next if _k_next_valid else halfN
-        elif _prev_now in (START, MEDIUM):
-            codingParams.nSamplesPerBlock = halfN_short
-        elif _prev_now == SHORT:
-            # STOP was just queued; block_queue is non-empty so this branch
-            # is only reached if more SHORTs remain.
-            codingParams.nSamplesPerBlock = halfN_short
-        else:  # STOP → LONG
-            codingParams.nSamplesPerBlock = halfN
-
         return
 
     def Close(self, codingParams):
@@ -1275,6 +1215,7 @@ class RMCFile(AudioFile):
             data = [
                 np.zeros(codingParams.nMDCTLines) for _ in range(codingParams.nChannels)
             ]
+            codingParams.next_k_attack = -1
             self.WriteDataBlock(data, codingParams)
             total = codingParams._stat_total_blocks
             pred = codingParams._stat_pred_blocks

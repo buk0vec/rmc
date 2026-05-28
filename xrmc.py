@@ -22,27 +22,49 @@ from pathlib import Path
 
 import numpy as np
 
+from blockswitching import K_ATTACK_MAX, LONG, STOP
 from features import RMCFeatures
 from pcmfile import *  # to get access to WAV file handling
 from rmcfile import *  # to get access to RMC file handling
-from spe import detectTransientsSPESamples
+from spe import RingBuffer
+
+TEMPO_EXCERPT_SECONDS = 30
 
 
 def detect_tempo(inFilename: str) -> int:
     """Estimate the dominant tempo of an audio file using madmom's RNN beat tracker."""
+    from madmom.audio.signal import Signal
     from madmom.features.beats import RNNBeatProcessor
-    from madmom.features.tempo import CombFilterTempoHistogramProcessor, TempoEstimationProcessor
+    from madmom.features.tempo import (
+        CombFilterTempoHistogramProcessor,
+        TempoEstimationProcessor,
+    )
 
     act_proc = RNNBeatProcessor()
     hist_proc = CombFilterTempoHistogramProcessor(fps=100)
-    tempo_proc = TempoEstimationProcessor(fps=100, histogram_processor=hist_proc)
+    # method=None suppresses the deprecation warning for the default 'comb' method
+    tempo_proc = TempoEstimationProcessor(
+        fps=100, method=None, histogram_processor=hist_proc
+    )
 
-    activations = act_proc(inFilename)
+    sig = Signal(
+        inFilename,
+        sample_rate=44100,
+        num_channels=1,
+        stop=TEMPO_EXCERPT_SECONDS * 44100,
+    )
+    activations = act_proc(sig)
     tempi = tempo_proc(activations)
     if len(tempi) == 0:
         print("Auto-tempo detection returned no result — defaulting to 120 BPM")
         return 120
-    return int(round(float(tempi[0][0])))
+    raw_tempo = float(tempi[0][0])
+    # Octave-fold into [50, 200] range
+    while raw_tempo < 50.0:
+        raw_tempo *= 2.0
+    while raw_tempo > 200.0:
+        raw_tempo /= 2.0
+    return int(round(raw_tempo))
 
 
 def print_flavor():
@@ -105,60 +127,62 @@ def Encode(
     if verbose:
         print(f"\nEncoding {inFilename} -> {codedFilename} at {kbps} kb/s")
 
-    if features.BLOCK_SWITCHING:
-        events = detectTransientsSPESamples(
-            inFilename, nMDCTLines=nMDCTLines, verbose=verbose
-        )
-        # Exact sample positions — no grid alignment or shift heuristics needed.
-        # Enforce minimum 2048-sample spacing so cascades can never collide.
-        # min cascade = (15+0)*halfN_short + halfN_short + halfN_short + halfN
-        #             = 17*halfN_short + halfN  (halfN_short = nMDCTLines//16)
-        min_spacing = 17 * (nMDCTLines // 16) + nMDCTLines  # 2112 samples
-        transient_positions = []
-        last_pos = -min_spacing
-        for e in events:
-            si = int(e["sample_index"])
-            if si - last_pos >= min_spacing and si >= nMDCTLines:
-                transient_positions.append(si)
-                last_pos = si
-        transient_map = {}
-        if verbose:
-            print(
-                f"TransientDetection: {len(transient_positions)} events (exact positions)"
-            )
-    else:
-        transient_map = {}
-        transient_positions = []
-        if verbose:
+    if verbose:
+        if features.BLOCK_SWITCHING:
+            print("Block switching enabled (streaming transient detection)")
+        else:
             print("Block switching disabled, using all LONG blocks")
 
-    codingParams.transientBlocks = transient_map
-    codingParams.transientPositions = transient_positions
-    codingParams.blockIndex = 0
     codingParams.targetBitsPerSample = targetBitsPerSample
 
     # open the output file
     outFile.OpenForWriting(codingParams)  # (includes writing header)
-    # Read the input file and pass its data to the output file to be written
+
+    halfN = codingParams.nMDCTLines
+    halfN_short = codingParams.nMDCTLines_short
+
     total_samples = codingParams.numSamples
     processed_samples = 0
 
     from tqdm import tqdm
 
+    rb = RingBuffer(inFile, codingParams, halfN)
+
     pbar = tqdm(total=total_samples, unit="samp", desc="Encoding", disable=not verbose)
 
+    pos = 0
+    prev = LONG
+
     while True:
-        data = inFile.ReadDataBlock(codingParams)
-        if not data:
+        if prev in (LONG, STOP):
+            hit = rb.spe_peek() if features.BLOCK_SWITCHING else None
+            if hit is not None:
+                k = max(0, min(K_ATTACK_MAX, (hit - pos - halfN) // halfN_short))
+                codingParams.nSamplesPerBlock = (15 + k) * halfN_short
+                codingParams.next_k_attack = k
+            else:
+                codingParams.nSamplesPerBlock = halfN
+                codingParams.next_k_attack = -1
+        elif codingParams.block_queue:
+            codingParams.nSamplesPerBlock = codingParams.block_queue[0]["b"]
+        else:
+            codingParams.nSamplesPerBlock = halfN_short
+
+        n = codingParams.nSamplesPerBlock
+        data = rb.step(n)
+        if data is None:
             break
         outFile.WriteDataBlock(data, codingParams)
-        n = len(data[0])
+        pos = codingParams.currentSamplePos
+        prev = codingParams.blockType
         processed_samples += n
         pbar.update(n)
+
     pbar.close()
 
     inFile.Close(codingParams)
     outFile.Close(codingParams)
+    return codingParams
 
 
 def Decode(
@@ -181,8 +205,11 @@ def Decode(
 
     outFile.OpenForWriting(codingParams)
 
-    total_samples = codingParams.numSamples
-    processed_samples = 0
+    total_samples = codingParams.numSamples  # original source length
+    # Skip the first nMDCTLines decoded samples (MDCT startup latency) so that
+    # the output is aligned with the input file in time.
+    skip_remaining = codingParams.nMDCTLines
+    write_remaining = total_samples
 
     from tqdm import tqdm
 
@@ -192,10 +219,29 @@ def Decode(
         data = inFile.ReadDataBlock(codingParams)
         if not data:
             break
-        outFile.WriteDataBlock(data, codingParams)
+
+        if skip_remaining > 0:
+            skip = min(skip_remaining, len(data[0]))
+            data = [ch[skip:] for ch in data]
+            skip_remaining -= skip
+
+        if len(data[0]) == 0:
+            continue
+
+        if write_remaining <= 0:
+            break
+
         n = len(data[0])
-        processed_samples += n
+        if n > write_remaining:
+            data = [ch[:write_remaining] for ch in data]
+            n = write_remaining
+
+        outFile.WriteDataBlock(data, codingParams)
+        write_remaining -= n
         pbar.update(n)
+
+        if write_remaining <= 0:
+            break
     pbar.close()
 
     inFile.Close(codingParams)
@@ -239,8 +285,14 @@ if __name__ == "__main__":
         help="Tempo in BPM (encode only, default: auto-detect via madmom)",
     )
 
-    parser.add_argument("--tdbs", action="store_true", help="Enable transient detection + block switching")
-    parser.add_argument("--pred", action="store_true", help="Enable rhythmic prediction")
+    parser.add_argument(
+        "--tdbs",
+        action="store_true",
+        help="Enable transient detection + block switching",
+    )
+    parser.add_argument(
+        "--pred", action="store_true", help="Enable rhythmic prediction"
+    )
     parser.add_argument("--entropy", action="store_true", help="Enable entropy coding")
 
     args = parser.parse_args()

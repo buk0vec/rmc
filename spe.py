@@ -320,3 +320,149 @@ def detectTransientsSPESamples(audioPath: str,
     if verbose:
         print(f"  SPE events ({len(events)}): {[e['sample_index'] for e in events]}")
     return events
+
+
+class RingBuffer:
+    """
+    Single-handle ring buffer for encoder data + streaming SPE transient detection.
+
+    Maintains a 4096-sample ring fed from inFile. The encoder reads via step(n),
+    which also advances the tri-band HPF by n samples each block. spe_peek()
+    runs SPE on the current lookahead window without consuming it.
+
+    Pointer invariant (absolute sample indices):
+        encoder_pos  ≤  filter_pos  =  encoder_pos + halfN
+        filter_pos   ≤  write_pos   =  encoder_pos + 2*halfN
+    """
+
+    _C = 4096  # ring capacity; power of 2 so masking works
+
+    def __init__(self, inFile, codingParams, halfN):
+        self._halfN = halfN
+        self._nCh = codingParams.nChannels
+        self._inFile = inFile
+        self._cp = codingParams
+        self._total = codingParams.numSamples
+        self._buf = np.zeros((self._nCh, self._C), dtype=np.float64)
+
+        self._encoder_pos = 0
+        self._filter_pos = 0
+        self._write_pos = 0
+        self._eof = False
+
+        self._filters = [_design_highpass(codingParams.sampleRate, cf)
+                         for cf in (HPF_CUTOFF, HPF_CUTOFF2, HPF_CUTOFF3)]
+        self._filter_states = None
+        self._rolling_prev = np.zeros((len(self._filters), halfN))
+
+        self._prefill()
+
+    def _write_raw(self, data):
+        n = len(data[0])
+        i = self._write_pos & (self._C - 1)
+        tail = self._C - i
+        if n <= tail:
+            for ch, arr in enumerate(data):
+                self._buf[ch, i:i + n] = arr
+        else:
+            for ch, arr in enumerate(data):
+                self._buf[ch, i:] = arr[:tail]
+                self._buf[ch, :n - tail] = arr[tail:]
+        self._write_pos += n
+
+    def _read_ring(self, start, n):
+        i = start & (self._C - 1)
+        if i + n <= self._C:
+            return self._buf[:, i:i + n].copy()
+        return np.concatenate([self._buf[:, i:], self._buf[:, :n - (self._C - i)]], axis=1)
+
+    def _file_read(self, n):
+        """Read n samples from file into ring; writes zeros when past EOF."""
+        if self._eof:
+            self._write_raw([np.zeros(n) for _ in range(self._nCh)])
+            return
+        saved = self._cp.nSamplesPerBlock
+        self._cp.nSamplesPerBlock = n
+        data = self._inFile.ReadDataBlock(self._cp)
+        self._cp.nSamplesPerBlock = saved
+        if data is None:
+            self._eof = True
+            self._write_raw([np.zeros(n) for _ in range(self._nCh)])
+            return
+        self._write_raw(data)
+
+    def _mono(self, arr):
+        return arr.mean(axis=0) if self._nCh > 1 else arr[0]
+
+    def _run_hpf(self, mono, update=True):
+        """Run all HPF bands on mono signal. update=False for non-destructive peek."""
+        out = np.zeros((len(self._filters), len(mono)))
+        for i, (filt, state) in enumerate(zip(self._filters, self._filter_states)):
+            y, new_state = scipy.signal.sosfilt(filt, mono, zi=state)
+            out[i] = y
+            if update:
+                self._filter_states[i] = new_state
+        return out
+
+    def _prefill(self):
+        """Pre-fill ring with 2*halfN samples; filter first halfN to prime rolling_prev."""
+        halfN = self._halfN
+        self._file_read(2 * halfN)
+
+        first_mono = self._mono(self._read_ring(0, halfN))
+        self._filter_states = [
+            scipy.signal.sosfilt_zi(f) * first_mono[0]
+            for f in self._filters
+        ]
+
+        hp = self._run_hpf(first_mono, update=True)
+        self._rolling_prev = hp
+        self._filter_pos = halfN
+
+    def step(self, n):
+        """
+        Advance ring by n samples. Returns block data as list of channel arrays, or None at EOF.
+        Replaces inFile.ReadDataBlock in the encode loop.
+        """
+        if self._encoder_pos >= self._total:
+            return None
+
+        self._file_read(n)
+
+        mono = self._mono(self._read_ring(self._filter_pos, n))
+        hp = self._run_hpf(mono, update=True)
+
+        halfN = self._halfN
+        if n >= halfN:
+            self._rolling_prev = hp[:, -halfN:]
+        else:
+            self._rolling_prev = np.roll(self._rolling_prev, -n, axis=1)
+            self._rolling_prev[:, -n:] = hp
+
+        data_arr = self._read_ring(self._encoder_pos, n)
+
+        self._encoder_pos += n
+        self._filter_pos += n
+
+        return [data_arr[ch] for ch in range(self._nCh)]
+
+    def spe_peek(self):
+        """
+        Run tri-band SPE on the current lookahead window without advancing state.
+        Returns absolute hit sample position (encoder_pos + halfN + offset), or None.
+        """
+        if self._filter_states is None:
+            return None
+        halfN = self._halfN
+        peek_mono = self._mono(self._read_ring(self._filter_pos, halfN))
+        hp_curr = self._run_hpf(peek_mono, update=False)
+
+        N = 2 * halfN
+        earliest = None
+        for i in range(len(self._filters)):
+            buf = np.concatenate([self._rolling_prev[i], hp_curr[i]])
+            fired, offset = spe_block(buf, N)
+            if fired:
+                earliest = offset if earliest is None else min(earliest, offset)
+
+        return (self._encoder_pos + halfN + earliest) if earliest is not None else None

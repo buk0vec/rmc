@@ -7,11 +7,13 @@ from mdct import MDCT
 
 PRED_MAP = {
     None: 0,
-    "quarter": 1,
-    "half": 2,
-    "bar": 3,
-    "2bar": 4,
-    "4bar": 5,
+    "eighth": 1,
+    "quarter": 2,
+    "half": 3,
+    "bar": 4,
+    "2bar": 5,
+    "3bar": 6,
+    "4bar": 7,
 }
 
 # 3-bit (8-entry) gain table for complex prediction — log-spaced over [0.06, 2.50].
@@ -37,6 +39,10 @@ def pred_type_to_samples(pred_type, coding_params):
         mapping["2bar"] = getattr(coding_params, "numSamples2Bar")
     if hasattr(coding_params, "numSamples4Bar"):
         mapping["4bar"] = getattr(coding_params, "numSamples4Bar")
+    if hasattr(coding_params, "numSamplesEighthNote"):
+        mapping["eighth"] = getattr(coding_params, "numSamplesEighthNote")
+    if hasattr(coding_params, "numSamples3Bar"):
+        mapping["3bar"] = getattr(coding_params, "numSamples3Bar")
     try:
         return mapping[pred_type]
     except KeyError as exc:
@@ -192,9 +198,13 @@ def get_best_region(
     buffer_fill = getattr(coding_params, "buffer_fill", len(buffer))
     valid_from = max(0, len(buffer) - buffer_fill)
 
-    range_types = ("quarter", "half", "bar", "2bar", "4bar")
+    range_types = ("eighth", "3bar", "quarter", "half", "bar", "2bar", "4bar")
     results = {}
     for range_type in range_types:
+        if range_type == "eighth" and getattr(coding_params, "numSamplesEighthNote", 0) == 0:
+            continue
+        if range_type == "3bar" and getattr(coding_params, "numSamples3Bar", 0) == 0:
+            continue
         if range_type == "bar" and coding_params.numSamplesBar == 0:
             continue
         if range_type == "2bar" and getattr(coding_params, "numSamples2Bar", 0) == 0:
